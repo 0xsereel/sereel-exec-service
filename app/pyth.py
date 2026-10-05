@@ -28,8 +28,14 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {settings.pyth_api_key}"} if settings.pyth_api_key else {}
 
 
+def _check_auth(r: httpx.Response) -> None:
+    if r.status_code in (401, 403):
+        raise PriceError("PRICE_SOURCE_AUTH", f"Pyth Hermes rejected the credentials ({r.status_code}); check PYTH_API_KEY", 502)
+
+
 def get_price(feed_id: str, max_staleness_s: int | None = 30) -> PythPrice:
-    """Latest price; raises STALE_PRICE if older than max_staleness_s (None disables the check)."""
+    """Latest price. Raises STALE_PRICE if older than max_staleness_s (None disables the check) or the source is
+    unreachable, and PRICE_SOURCE_AUTH if Hermes rejects the credentials."""
     fid = feed_id.removeprefix("0x")
     if settings.pyth_mock_price is not None:
         return PythPrice(settings.pyth_mock_price, int(time.time()), fid)
@@ -38,8 +44,7 @@ def get_price(feed_id: str, max_staleness_s: int | None = 30) -> PythPrice:
                       params={"ids[]": fid, "parsed": "true"}, headers=_headers(), timeout=10)
     except httpx.HTTPError as e:
         raise PriceError("STALE_PRICE", f"Pyth unreachable: {e}", 503)
-    if r.status_code in (401, 403):
-        raise PriceError("STALE_PRICE", f"Pyth Hermes rejected the request ({r.status_code}); check PYTH_API_KEY", 503)
+    _check_auth(r)
     r.raise_for_status()
     parsed = r.json().get("parsed") or []
     if not parsed:
@@ -56,5 +61,6 @@ def search_feeds(query: str, asset_type: str | None = None) -> list[dict]:
     if asset_type:
         params["asset_type"] = asset_type
     r = httpx.get(f"{settings.pyth_hermes_url}/v2/price_feeds", params=params, headers=_headers(), timeout=10)
+    _check_auth(r)
     r.raise_for_status()
     return [{"id": f["id"], "symbol": f["attributes"].get("symbol"), "type": f["attributes"].get("asset_type")} for f in r.json()]

@@ -83,7 +83,7 @@ def hermes(monkeypatch, status=200, publish_time=None, price="265000", expo=-2):
 def test_pyth_parses_exponent_and_sends_key(monkeypatch):
     monkeypatch.setattr(settings, "pyth_api_key", "k")
     seen = hermes(monkeypatch)
-    assert pyth.get_price("ab").price == Decimal("2650.00") and seen["headers"] == {"x-api-key": "k"}
+    assert pyth.get_price("ab").price == Decimal("2650.00") and seen["headers"] == {"Authorization": "Bearer k"}
 
 
 def test_pyth_stale_and_rejected(monkeypatch):
@@ -92,10 +92,26 @@ def test_pyth_stale_and_rejected(monkeypatch):
         pyth.get_price("ab", max_staleness_s=30)
     assert e.value.code == "STALE_PRICE"
     assert pyth.get_price("ab", max_staleness_s=None).price  # check can be disabled
-    hermes(monkeypatch, status=401)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_pyth_auth_failure_has_distinct_code(monkeypatch, status):
+    hermes(monkeypatch, status=status)
     with pytest.raises(ServiceError) as e:
         pyth.get_price("ab")
-    assert e.value.code == "STALE_PRICE" and "PYTH_API_KEY" in e.value.message
+    assert e.value.code == "PRICE_SOURCE_AUTH" and "PYTH_API_KEY" in e.value.message and e.value.status == 502
+
+
+def test_pyth_search_auth_failure_also_distinct(monkeypatch):
+    hermes(monkeypatch, status=401)
+    with pytest.raises(ServiceError) as e:
+        pyth.search_feeds("XAU")
+    assert e.value.code == "PRICE_SOURCE_AUTH"
+
+
+def test_pyth_default_base_url():
+    from app.config import Settings
+    assert Settings(_env_file=None).pyth_hermes_url == "https://pyth.dourolabs.app/hermes"
 
 
 def test_rpc_retries_throttling_then_succeeds(monkeypatch):

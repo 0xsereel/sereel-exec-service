@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     hl_mm_api_wallet_key: str = ""
 
     venue: str = "hyperliquid"
-    pyth_hermes_url: str = "https://hermes.pyth.network"
+    pyth_hermes_url: str = "https://pyth.dourolabs.app/hermes"
     pyth_api_key: str = ""
     pyth_mock_price: Decimal | None = None  # dev/tests only: fixed price for every feed
     max_leverage: int = 3
