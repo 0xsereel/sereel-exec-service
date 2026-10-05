@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import JSON, Column, Numeric
+from sqlalchemy import JSON, Column, Numeric, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 # Strategy.status
@@ -164,7 +164,8 @@ class UsedNonce(SQLModel, table=True):
 
 class Schedule(SQLModel, table=True):
     id: str = Field(default_factory=new_id, primary_key=True)
-    name: str
+    name: str = Field(index=True)
+    fund_id: str | None = None
     to: str
     interval_seconds: int
     amount_mode: str = "fixed"  # fixed | priced
@@ -174,13 +175,15 @@ class Schedule(SQLModel, table=True):
     max_payments: int | None = None
     end_at: datetime | None = None
     status: str = "active"  # active | paused | stopped | done
-    seq: int = 0
+    seq: int = 0  # last claimed payment number
     total_paid_usd: Decimal = money()
     next_run: datetime | None = None
     created_at: datetime = Field(default_factory=now)
 
 
 class Payment(SQLModel, table=True):
+    # (schedule_id, seq) is unique: a scheduled run can only ever be claimed once, whatever process asks
+    __table_args__ = (UniqueConstraint("schedule_id", "seq"),)
     id: str = Field(default_factory=new_id, primary_key=True)
     schedule_id: str | None = Field(default=None, index=True)
     seq: int | None = None
@@ -188,5 +191,6 @@ class Payment(SQLModel, table=True):
     amount_usd: Decimal = money()
     memo: str = ""
     signature: str | None = None
-    status: str = "sent"  # claimed | sent | failed ("claimed" is written before sending, so a restart never double-pays)
+    status: str = "claimed"  # claimed -> sent | failed | unconfirmed (claimed is written BEFORE sending; never auto-resent)
+    error: str | None = None
     created_at: datetime = Field(default_factory=now)

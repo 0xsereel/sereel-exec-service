@@ -1,8 +1,7 @@
-import hmac
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -12,20 +11,12 @@ from starlette.exceptions import HTTPException  # the base class: also covers un
 from . import solana_client as sol
 from .config import load_markets, settings
 from .db import init_db, session
+from .deps import auth, require_key  # noqa: F401  (re-exported)
 from .errors import ServiceError
 from .models import S_ACTIVE, Schedule, Strategy
 
 VERSION = "0.1.0"
 log = logging.getLogger("sereel")
-
-
-def require_key(x_sereel_key: str | None = Header(default=None)) -> None:
-    """Every route except /health. Fails closed: with no API_KEY configured nothing is authorised."""
-    if not settings.api_key or not x_sereel_key or not hmac.compare_digest(x_sereel_key, settings.api_key):
-        raise ServiceError("UNAUTHORIZED", "missing or invalid X-Sereel-Key", 401)
-
-
-auth = [Depends(require_key)]
 
 
 class State:
@@ -41,10 +32,15 @@ state = State()
 async def lifespan(app: FastAPI):
     settings.assert_network_safe()
     init_db()
+    from .payments import scheduler
     from .venue.hyperliquid import get_venue
 
     state.venue = get_venue(state.markets)
-    yield
+    sched = scheduler.start()
+    try:
+        yield
+    finally:
+        sched.shutdown(wait=False)
 
 
 app = FastAPI(title="Sereel Execution Service", version=VERSION, lifespan=lifespan)
@@ -78,6 +74,11 @@ async def _http_error(_: Request, exc: HTTPException):
 async def _unexpected(_: Request, exc: Exception):
     log.exception("unhandled error")
     return err(500, "INTERNAL", "unexpected error")
+
+
+from .payments.router import router as payments_router  # noqa: E402
+
+app.include_router(payments_router)
 
 
 @app.get("/health")

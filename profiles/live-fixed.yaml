@@ -1,0 +1,8 @@
+name: live-fixed
+fund_id: demo
+to: B4GhTUdnJt5fjnnBydsJyi58kDaD7i7UjY33b6owbZGE
+interval_seconds: 15
+amount_mode: fixed
+amount_usd: 10.0
+memo_template: Revenue payment {seq}
+max_payments: 3
