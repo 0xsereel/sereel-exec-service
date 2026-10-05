@@ -1,0 +1,39 @@
+{
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "publicKey": "FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF",
+ "strategy_id": "5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10",
+ "nonce": "0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921",
+ "timestamp": 1759577234123,
+ "vectors": [
+  {
+   "action": "edit_hedge_settings",
+   "params": {
+    "hedge_ratio_bps": 7000,
+    "target_exposure_units": "520.5"
+   },
+   "canonical": "{\"hedge_ratio_bps\":7000,\"target_exposure_units\":\"520.5\"}",
+   "params_hash": "470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104",
+   "message": "sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|edit_hedge_settings|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123",
+   "signature": "wDzgfP9LujamT86N5oFrhgQTbTMxCH8MAppFqHFKCBceUssdgCtu4sNmPQu6FpGQ8T18va333LTyc6YDQNwk7Q8"
+  },
+  {
+   "action": "return_excess",
+   "params": {
+    "amount_usd": "1250.75",
+    "destination_wallet_address": "7VPsT9gYv64jKtqysgAxR6xofJCsGSP4DsPDNhtkGi1L"
+   },
+   "canonical": "{\"amount_usd\":\"1250.75\",\"destination_wallet_address\":\"7VPsT9gYv64jKtqysgAxR6xofJCsGSP4DsPDNhtkGi1L\"}",
+   "params_hash": "e9b0a7572489a86d4db11cb1014485034d878633cf2869b029a09d84e68f8aa8",
+   "message": "sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|return_excess|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|e9b0a7572489a86d4db11cb1014485034d878633cf2869b029a09d84e68f8aa8|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123",
+   "signature": "4Cosv4o7E2qi9UzCXzGymAy7Ji2xfnsxAH9cZinnPNXSXnkdC7hw3PHkpYjU9Daf7szsgqpBDY8W3XSsAwAm1oi"
+  },
+  {
+   "action": "rebalance",
+   "params": {},
+   "canonical": "{}",
+   "params_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "message": "sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|rebalance|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123",
+   "signature": "3F4AH1d47V6hCVYuYb2GcVFei6SS2LXyjdVkGiRYrP73rpk8FtzMEEprzn4p6YabsU3dEH9D92H2VciztPi6PtoB"
+  }
+ ]
+}

@@ -5,6 +5,7 @@ import logging
 import time
 import uuid
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import base58
@@ -39,28 +40,29 @@ def clean():
 # ---- canonical JSON / hash / message ---------------------------------------
 
 @pytest.mark.parametrize("obj,expected", [
-    ({}, "{}"), ([], "[]"), (None, "null"), (True, "true"), (False, "false"),
+    ({}, "{}"), ([], "[]"), (None, "null"), (True, "true"), (False, "false"), (7000, "7000"), (0, "0"), (-5, "-5"),
     ({"b": 1, "a": {"d": 2, "c": [3, {"z": 1, "y": 2}]}}, '{"a":{"c":[3,{"y":2,"z":1}],"d":2},"b":1}'),  # keys sorted recursively
-    (520.0, "520"), (7000, "7000"), (0.6, "0.6"), (-3.25, "-3.25"), (-0.0, "0"),  # JS has no 520.0 / -0
-    (1e21, "1e+21"), (1e-7, "1e-7"), (1.5e-7, "1.5e-7"), (0.00001, "0.00001"), (0.000001, "0.000001"), (123456789012345680000.0, "123456789012345680000"),
-    ("a\"b\\c\n\t\u0001é€", '"a\\"b\\\\c\\n\\t\\u0001é€"'),  # JSON.stringify escapes, but leaves non-ASCII alone
-    ({"hedge_ratio_bps": 7000, "target_exposure_units": 520.5}, '{"hedge_ratio_bps":7000,"target_exposure_units":520.5}'),
+    ("520.5", '"520.5"'),  # a decimal string stays a string
+    ("a\"b\\c\n\t\u0001é€", '"a\\"b\\\\c\\n\\t\\u0001é€"'),  # JSON.stringify escapes, non-ASCII left alone
+    ({"hedge_ratio_bps": 7000, "target_exposure_units": "520.5"}, '{"hedge_ratio_bps":7000,"target_exposure_units":"520.5"}'),
     ([1, [2, [3]], {"a": [True, None]}], '[1,[2,[3]],{"a":[true,null]}]'),
 ])
-def test_canonical_json_matches_javascript(obj, expected):
+def test_canonical_json_format(obj, expected):
     assert auth.canonical_json(obj) == expected
 
 
-def test_canonical_json_rejects_non_finite_numbers():
-    for bad in (float("nan"), float("inf")):
-        with pytest.raises(ValueError):
-            auth.canonical_json(bad)
+@pytest.mark.parametrize("bad", [0.6, 520.0, -0.0, 1e21, float("nan"), float("inf"), 2 ** 53, Decimal("1.5"), b"bytes", object()])
+def test_canonical_json_refuses_floats_decimals_and_unsafe_integers(bad):
+    with pytest.raises(ValueError):
+        auth.canonical_json(bad)
+    with pytest.raises(ValueError):
+        auth.canonical_json({"nested": [bad]})
 
 
 def test_params_hash_is_lowercase_hex_sha256_of_the_canonical_text():
     assert auth.params_hash({}) == "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"  # sha256("{}")
-    p = {"amount_usd": 12.5, "destination_wallet_address": "abc"}
-    assert auth.params_hash(p) == hashlib.sha256(b'{"amount_usd":12.5,"destination_wallet_address":"abc"}').hexdigest()
+    p = {"amount_usd": "12.5", "destination_wallet_address": "abc"}
+    assert auth.params_hash(p) == hashlib.sha256(b'{"amount_usd":"12.5","destination_wallet_address":"abc"}').hexdigest()
     assert auth.params_hash({"b": 1, "a": 2}) == auth.params_hash({"a": 2, "b": 1})  # order of keys does not matter
 
 
@@ -110,16 +112,16 @@ def test_malformed_authorization_is_invalid(mutate):
 
 
 def test_the_signature_binds_action_strategy_and_params():
-    a = sign("edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": 520})
-    check(a, "edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": 520})
+    a = sign("edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": "520"})
+    check(a, "edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": "520"})
     for kw in (dict(action="rebalance", params={}),  # same signature replayed as a different action
                dict(sid="strategy-2"),  # ... on a different strategy
-               dict(params={"hedge_ratio_bps": 9999, "target_exposure_units": 520}),  # ... or with tampered params
+               dict(params={"hedge_ratio_bps": 9999, "target_exposure_units": "520"}),  # ... or with tampered params
                dict(params={"hedge_ratio_bps": 7000})):  # ... or with a field dropped
-        args = dict(action="edit_hedge_settings", params={"hedge_ratio_bps": 7000, "target_exposure_units": 520}, sid=SID)
+        args = dict(action="edit_hedge_settings", params={"hedge_ratio_bps": 7000, "target_exposure_units": "520"}, sid=SID)
         args.update(kw)
         with pytest.raises(ServiceError) as e:
-            check(sign("edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": 520}), **args)
+            check(sign("edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": "520"}), **args)
         assert e.value.code == "AUTHORIZATION_INVALID", kw
 
 
@@ -191,6 +193,81 @@ def test_old_nonces_are_pruned():
     check(sign())
     with Session(engine) as db:
         assert "ancient" not in {n.nonce for n in db.exec(select(UsedNonce)).all()}
+
+
+# ---- decimal strings, never JSON numbers --------------------------------------------------------------------
+
+@pytest.mark.parametrize("params", [
+    {"target_exposure_units": 520.5},  # a JSON float where a decimal string belongs
+    {"target_exposure_units": 520},  # even a whole JSON number
+    {"amount_usd": 12.5},
+    {"amount_usd": 0},
+    {"hedge_ratio_bps": 7000.0},  # a float where an integer belongs
+    {"hedge_ratio_bps": "7000"},  # a string where an integer belongs
+    {"hedge_ratio_bps": True},
+    {"hedge_ratio_bps": -1},
+])
+def test_json_numbers_are_rejected_where_decimal_strings_belong(params):
+    a = sign("edit_hedge_settings", {"target_exposure_units": "1"})  # the signature itself is fine; the params are not
+    with pytest.raises(ServiceError) as e:
+        auth.verify(a, "edit_hedge_settings", SID, params, now_ms=T0)
+    assert (e.value.code, e.value.status) == ("AUTHORIZATION_INVALID", 403)
+
+
+def test_the_rejection_says_what_to_send_instead():
+    with pytest.raises(ServiceError) as e:
+        auth.verify(sign(), "rebalance", SID, {"amount_usd": 12.5}, now_ms=T0)
+    assert 'decimal string such as "520.5"' in e.value.message and "not a JSON number" in e.value.message and "params.amount_usd" in e.value.message
+
+
+@pytest.mark.parametrize("good", ["0", "1", "520", "520.5", "0.000001", "1250.75", "123456789.123456789012345678"])
+def test_valid_decimal_strings_are_accepted(good):
+    auth.validate_params({"amount_usd": good})
+    auth.validate_params({"target_exposure_units": good})
+
+
+@pytest.mark.parametrize("bad", ["", " 1", "1 ", "+1", "-1", "1.", ".5", "01", "00.5", "1e3", "1E3", "1,5", "0x10", "NaN", "Infinity",
+                                 "1.1234567890123456789", "١٢٣", None, [], {}])
+def test_malformed_decimal_strings_are_rejected(bad):
+    with pytest.raises(ServiceError) as e:
+        auth.validate_params({"amount_usd": bad})
+    assert e.value.code == "AUTHORIZATION_INVALID"
+
+
+def test_other_param_types_and_unknown_fields():
+    auth.validate_params({"destination_wallet_address": "abc", "owner_pubkey": "x", "owner_multisig": "y", "hedge_ratio_bps": 0})
+    for bad in ({"destination_wallet_address": 5}, {"owner_pubkey": None}, {"surprise": "x"}):
+        with pytest.raises(ServiceError):
+            auth.validate_params(bad)
+
+
+def test_a_number_is_rejected_before_anything_is_stored_or_checked(api):
+    """Rejected params never burn a nonce and never reach the owner check."""
+    a = sign("edit_hedge_settings", {"target_exposure_units": "1"})
+    with pytest.raises(ServiceError):
+        auth.verify(a, "edit_hedge_settings", SID, {"target_exposure_units": 1}, now_ms=T0)
+    with Session(engine) as db:
+        assert db.exec(select(UsedNonce)).all() == []
+
+
+def test_published_test_vectors_match_the_implementation_and_the_readme():
+    """The README tells client authors to check their code against these exact values."""
+    v = json.loads((Path(__file__).parent / "fixtures" / "auth_vectors.json").read_text())
+    signer = Signer(bytes.fromhex(v["seed_hex"]))
+    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    assert signer.pubkey == v["publicKey"] and v["publicKey"] in readme
+    for vec in v["vectors"]:
+        assert auth.canonical_json(vec["params"]) == vec["canonical"]
+        assert auth.params_hash(vec["params"]) == vec["params_hash"]
+        a = signer.authorization(vec["action"], v["strategy_id"], vec["params"], ts=v["timestamp"], nonce=v["nonce"])
+        assert (a["message"], a["signature"]) == (vec["message"], vec["signature"])  # ed25519 is deterministic
+        for field in ("canonical", "params_hash", "message", "signature"):
+            assert vec[field] in readme, f"README is missing the {field} of the {vec['action']} vector"
+        verified = auth.verify(a, vec["action"], v["strategy_id"], vec["params"], now_ms=v["timestamp"])
+        assert verified.signer == signer.pubkey
+        with Session(engine) as db:  # the vectors reuse one nonce; clear it so each can be verified
+            db.exec(__import__("sqlmodel").delete(UsedNonce))
+            db.commit()
 
 
 # ---- Squads ----------------------------------------------------------------

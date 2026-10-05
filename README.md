@@ -179,18 +179,93 @@ attestation. This is an addition to the v4 create body, so the frontend must sen
 sereel-strategy-v1|solana|<wallet_pubkey>|<action>|<strategy_id>|<params_hash>|<nonce>|<timestamp_ms>
 ```
 
-`params_hash` is the lowercase hex sha256 of the canonical JSON of the action's own params (keys sorted recursively, no
-whitespace, JavaScript `JSON.stringify` rules for primitives, e.g. `520.0` is `520`). The signature is a raw ed25519
-signature over the UTF-8 message, base58. The request carries `authorization: {message, signature, nonce, timestamp,
-publicKey}`. Actions and their params:
+- `wallet_pubkey`: the signer's base58 Solana public key. `action`: one of the table below. `strategy_id`: the `{id}` in
+  the path. `nonce`: a fresh UUID v4 per request. `timestamp_ms`: Unix **milliseconds** (`Date.now()`), not seconds.
+- `signature`: a raw **ed25519** signature over the UTF-8 bytes of the message (`nacl.sign.detached`), base58-encoded.
+  It is not a Solana transaction signature; there is no transaction.
+- The request carries `authorization: {message, signature, nonce, timestamp, publicKey}` (`timestamp` a JSON integer).
 
-| Action | Endpoint | params (exactly the fields sent) |
+### Canonical params format (the exact spec for clients)
+
+`params_hash` is the **lowercase hex SHA-256 of the canonical params text**, encoded as UTF-8. The params are an object
+holding exactly the fields the action lists below, *with the values the request body carries*, and nothing more.
+
+1. **Sorted keys.** Object keys are sorted (by Unicode code point) at every level.
+2. **No whitespace** anywhere: `{"a":"1","b":2}`, never `{ "a": "1", "b": 2 }`.
+3. **Amounts, prices and quantities are decimal strings**, never JSON numbers: `"520.5"`, not `520.5`. A decimal string
+   is digits with an optional fractional part of 1 to 18 digits: no sign, no exponent, no leading zeros, no trailing
+   dot (`"0"`, `"1250.75"`, `"0.000001"` are valid; `"+1"`, `"-1"`, `"1e3"`, `"01"`, `"1."`, `".5"` are not). The string
+   is hashed exactly as sent: `"520"` and `"520.0"` are different strings and hash differently.
+4. **Whole-number fields** (basis points) are JSON **integers**: `7000`, never `7000.0` or `"7000"`.
+5. **No floats anywhere.** A JSON number where a decimal string belongs, or a float where an integer belongs, is rejected
+   with **`AUTHORIZATION_INVALID`**. This is deliberate: two clients can print the same number differently
+   (`520.0` vs `520`, `1e-7` vs `0.0000001`) and would sign different bytes.
+6. **Strings** are escaped as `JSON.stringify` does (`"`, `\`, control characters as `\n` / `\u00XX`); non-ASCII
+   characters are written as is (UTF-8), not as `\uXXXX`.
+7. The server hashes the values it read from the **raw request body**, so what you hash must be what you send.
+
+Field types (anything else is not signable and is rejected):
+
+| Field | Type |
+|---|---|
+| `target_exposure_units`, `amount_usd` | decimal string |
+| `hedge_ratio_bps` | integer |
+| `destination_wallet_address`, `owner_pubkey`, `owner_multisig` | string |
+
+Actions, their endpoints, and exactly which fields are hashed (only those present in the body):
+
+| Action | Endpoint | params |
 |---|---|---|
-| `edit_hedge_settings` | `PATCH /strategies/{id}` | `hedge_ratio_bps`, `target_exposure_units` |
+| `edit_hedge_settings` | `PATCH /strategies/{id}` | `hedge_ratio_bps` (integer), `target_exposure_units` (decimal string) |
 | `rebalance` | `POST /strategies/{id}/rebalance` | `{}` |
-| `return_excess` | `POST /strategies/{id}/withdrawals` | `amount_usd`, `destination_wallet_address` |
+| `return_excess` | `POST /strategies/{id}/withdrawals` | `amount_usd` (decimal string), `destination_wallet_address` |
 | `close_strategy` | `DELETE /strategies/{id}` | `destination_wallet_address` |
 | `change_owner` | `POST /strategies/{id}/owner` | one of `owner_pubkey` / `owner_multisig` |
+
+Note: for `edit_hedge_settings` the v4 draft sent `target_exposure_units` as a JSON number; it must now be sent (and
+signed) as a decimal string.
+
+### Test vectors
+
+Check your implementation against these before talking to the service. Every vector uses the same signer, strategy,
+nonce and timestamp; ed25519 signatures are deterministic, so you must reproduce the signature byte for byte.
+
+```
+ed25519 seed (hex)  000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+publicKey           FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF
+strategy_id         5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10
+nonce               0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921
+timestamp           1759577234123
+```
+
+**Vector 1: `edit_hedge_settings`**
+
+```
+params (canonical)  {"hedge_ratio_bps":7000,"target_exposure_units":"520.5"}
+params_hash         470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104
+message             sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|edit_hedge_settings|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123
+signature (base58)  wDzgfP9LujamT86N5oFrhgQTbTMxCH8MAppFqHFKCBceUssdgCtu4sNmPQu6FpGQ8T18va333LTyc6YDQNwk7Q8
+```
+
+**Vector 2: `return_excess`**
+
+```
+params (canonical)  {"amount_usd":"1250.75","destination_wallet_address":"7VPsT9gYv64jKtqysgAxR6xofJCsGSP4DsPDNhtkGi1L"}
+params_hash         e9b0a7572489a86d4db11cb1014485034d878633cf2869b029a09d84e68f8aa8
+message             sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|return_excess|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|e9b0a7572489a86d4db11cb1014485034d878633cf2869b029a09d84e68f8aa8|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123
+signature (base58)  4Cosv4o7E2qi9UzCXzGymAy7Ji2xfnsxAH9cZinnPNXSXnkdC7hw3PHkpYjU9Daf7szsgqpBDY8W3XSsAwAm1oi
+```
+
+**Vector 3: `rebalance`**
+
+```
+params (canonical)  {}
+params_hash         44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
+message             sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|rebalance|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123
+signature (base58)  3F4AH1d47V6hCVYuYb2GcVFei6SS2LXyjdVkGiRYrP73rpk8FtzMEEprzn4p6YabsU3dEH9D92H2VciztPi6PtoB
+```
+
+(The values above are checked against the implementation by a test, so they cannot go stale.)
 
 **Verification, on every call.** The server rebuilds the message from the request (it never trusts the client's string),
 verifies the signature, rejects a timestamp more than **60s old** or **30s ahead**, and rejects a nonce it has seen

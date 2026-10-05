@@ -2,8 +2,8 @@
 return excess, change owner). Cantina v4 contract:
 
     message   = sereel-strategy-v1|<network>|<wallet_pubkey>|<action>|<strategy_id>|<params_hash>|<nonce>|<timestamp>
-    params_hash = lowercase hex sha256 of the canonical JSON of the action's params (keys sorted recursively, no
-                  whitespace, JavaScript JSON.stringify for primitives)
+    params_hash = lowercase hex sha256 of the canonical JSON of the action's params (keys sorted, no whitespace,
+                  amounts as decimal strings, integers for whole-number fields; see FIELD_TYPES)
     signature = raw ed25519 over the UTF-8 message, base58
 
 The server rebuilds the message itself and never trusts the client's string. A strategy is managed by its bound owner:
@@ -13,11 +13,10 @@ import base64
 import hashlib
 import json
 import logging
-import math
+import re
 import time
 import uuid
 from datetime import timedelta
-from decimal import Decimal
 from typing import NamedTuple
 
 import base58
@@ -38,29 +37,24 @@ ACTIONS = ("return_excess", "close_strategy", "rebalance", "edit_hedge_settings"
 NONCE_TTL_S = 120  # anything older than the 60s age limit is already rejected; keep a margin
 
 
-# ---- canonical JSON (what JavaScript's JSON.stringify would produce) ------------------------------------------------
+# ---- canonical params ------------------------------------------------------------------------------------------------
+# The exact format clients must produce (see the README):
+#   * UTF-8 JSON, object keys sorted (by code point) at every level, no whitespace anywhere
+#   * every amount, price or quantity is a DECIMAL STRING ("520.5"); JSON numbers are not allowed for them
+#   * whole-number fields (basis points) are JSON integers; no floats anywhere
+#   * strings are escaped as JSON.stringify does (", \, control characters); non-ASCII is left as is
+MAX_SAFE_INT = 2 ** 53 - 1
+DECIMAL_RE = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$")  # no sign, no exponent, no leading zeros, <= 18 decimals
 
-def js_number(x) -> str:
-    if isinstance(x, bool):
-        raise ValueError("bool is not a number")
-    if isinstance(x, int):
-        return str(x)
-    if isinstance(x, Decimal):
-        x = float(x)
-    if not math.isfinite(x):
-        raise ValueError("non-finite number")
-    if x == int(x) and abs(x) < 1e21:
-        if abs(x) < 2 ** 53:
-            return str(int(x))  # 520.0 -> "520", -0.0 -> "0"
-        return format(Decimal(repr(x)), "f")  # beyond 2**53 JS prints the shortest digits padded with zeros, not the exact value
-    r = repr(x)
-    if "e" in r:
-        mantissa, exp = r.split("e")
-        exp = int(exp)
-        if -7 < exp < 0:  # JS prints 0.00001 in full; Python switches to exponent earlier
-            return format(Decimal(r), "f")
-        return f"{mantissa}e{'+' if exp >= 0 else '-'}{abs(exp)}"
-    return r
+# what each signed field must be: "decimal" (a decimal string), "int" (a JSON integer), "str" (a string)
+FIELD_TYPES = {
+    "hedge_ratio_bps": "int",
+    "target_exposure_units": "decimal",
+    "amount_usd": "decimal",
+    "destination_wallet_address": "str",
+    "owner_pubkey": "str",
+    "owner_multisig": "str",
+}
 
 
 def canonical_json(o) -> str:
@@ -70,15 +64,37 @@ def canonical_json(o) -> str:
         return "true"
     if o is False:
         return "false"
-    if isinstance(o, (int, float, Decimal)):
-        return js_number(o)
+    if isinstance(o, int):
+        if abs(o) > MAX_SAFE_INT:
+            raise ValueError("integer outside the safe range")
+        return str(o)
     if isinstance(o, str):
         return json.dumps(o, ensure_ascii=False)
     if isinstance(o, (list, tuple)):
         return "[" + ",".join(canonical_json(v) for v in o) + "]"
     if isinstance(o, dict):
         return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + canonical_json(o[k]) for k in sorted(o)) + "}"
-    raise TypeError(f"cannot canonicalise {type(o)}")
+    raise ValueError(f"{type(o).__name__} is not allowed in signed params (amounts and prices must be decimal strings)")
+
+
+def validate_params(params: dict) -> None:
+    """Reject anything that is not in the canonical params format. A JSON number where a decimal string belongs is
+    AUTHORIZATION_INVALID: two clients could otherwise serialise the same number differently and sign different bytes."""
+    for key, value in params.items():
+        kind = FIELD_TYPES.get(key)
+        if kind is None:
+            raise _invalid(f"params.{key} is not a signable field")
+        if isinstance(value, float) or (kind == "decimal" and isinstance(value, int) and not isinstance(value, bool)):
+            raise _invalid(f'params.{key} must be a decimal string such as "520.5", not a JSON number')
+        if kind == "decimal":
+            if not isinstance(value, str) or not DECIMAL_RE.match(value):
+                raise _invalid(f'params.{key} must be a decimal string such as "520.5" '
+                               "(digits with an optional fractional part: no sign, exponent or leading zeros)")
+        elif kind == "int":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > MAX_SAFE_INT:
+                raise _invalid(f"params.{key} must be a non-negative JSON integer")
+        elif not isinstance(value, str):
+            raise _invalid(f"params.{key} must be a string")
 
 
 def params_hash(params: dict) -> str:
@@ -138,6 +154,7 @@ def verify(authorization, action: str, strategy_id: str, params: dict, now_ms: i
     if ts - now_ms > settings.auth_future_skew_s * 1000:
         raise _invalid(f"authorization is dated more than {settings.auth_future_skew_s}s in the future")
 
+    validate_params(params)
     rebuilt = build_message(wallet, action, strategy_id, params, nonce, ts)  # from OUR view of the request
     if client_message != rebuilt:
         raise _invalid("authorization.message does not match this request")

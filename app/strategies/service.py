@@ -261,6 +261,33 @@ def change_owner(sid: str, params: dict, authorization, org: str = "") -> Strate
     return get_strategy(sid, org)
 
 
+def operator_set_owner(sid: str, owner_pubkey: str | None, owner_multisig: str | None) -> Strategy:
+    """OPERATOR ONLY (CLI on the host; there is deliberately no API route for this). Binds an owner to a strategy that
+    has none (e.g. one created before ownership existed). It cannot replace an existing owner: that is the owner's own
+    signed `change_owner` action. Attested, with bound_by: operator."""
+    new_pubkey, new_multisig = validate_owner(owner_pubkey, owner_multisig)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        if st is None:
+            raise ServiceError("NOT_FOUND", "strategy not found", 404)
+        if st.owner_pubkey or st.owner_multisig:
+            raise ServiceError("CONFLICT", "this strategy already has an owner; only the owner can change it (signed change_owner)", 409)
+        st.owner_pubkey, st.owner_multisig, st.updated_at = new_pubkey, new_multisig, now()
+        s.add(st)
+        s.commit()
+        fund = st.fund_id
+    record = {"event": "set_owner", "bound_by": "operator", "from": {"owner_pubkey": None, "owner_multisig": None},
+              "to": {"owner_pubkey": new_pubkey, "owner_multisig": new_multisig}}
+    asig = _record_action(sid, "set_owner", record, fund)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        st.last_attestation_sig = asig
+        s.add(st)
+        s.commit()
+        s.refresh(st)
+        return st
+
+
 # ---- ledger helpers ---------------------------------------------------------
 
 def sum_margins(s: Session, exclude: str | None = None) -> Decimal:

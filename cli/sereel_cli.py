@@ -13,11 +13,13 @@ from app.errors import ServiceError
 
 from . import setup
 from .payouts import payouts_app
+from .strategies import strategies_app
 
 app = typer.Typer(help="Sereel execution service CLI", no_args_is_help=True)
 mm_app = typer.Typer(help="Testnet market maker", no_args_is_help=True)
 app.add_typer(mm_app, name="mm")
 app.add_typer(payouts_app, name="payouts")
+app.add_typer(strategies_app, name="strategies")
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 FAUCET = "https://faucet.solana.com"
