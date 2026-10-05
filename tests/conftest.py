@@ -49,6 +49,8 @@ class FakeChain:
         self.funding = str(self.keys["funding"].pubkey())
         self.order, self.txs = [], {}
         self.refunds, self.memos = [], []
+        self.accounts: dict[str, dict] = {}  # address -> getAccountInfo value (for Squads reads)
+        self.rpc_calls: list[str] = []
         self.refund_fails = self.attest_fails = False
         self.fetch_errors: set[str] = set()
         self.n = 0
@@ -71,6 +73,11 @@ class FakeChain:
         return sig
 
     def _rpc(self, method, params=None):
+        self.rpc_calls.append(method)
+        if method == "getAccountInfo":
+            if self.accounts.get("__down__"):
+                raise self.sol.SolanaError("rpc down")
+            return {"value": self.accounts.get(params[0])}
         assert method == "getSignaturesForAddress", method
         limit = params[1].get("limit", 1000)
         return [{"signature": s, "err": None} for s in reversed(self.order)][:limit]

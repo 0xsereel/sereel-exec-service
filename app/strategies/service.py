@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlmodel import Session, select
 
+from .. import auth
 from .. import solana_client as sol
 from ..config import settings
 from ..db import engine
@@ -42,6 +43,8 @@ class CreateStrategyIn(BaseModel):
     return_wallet_address: str | None = None
     registered_sender_address: str
     expected_amount_usd: Decimal
+    owner_pubkey: str | None = None  # who may manage the strategy: the manager's Sereel wallet ...
+    owner_multisig: str | None = None  # ... or a Squads multisig account (its current members). Exactly one.
 
 
 class DepositIn(BaseModel):
@@ -88,6 +91,22 @@ def _check_wallet(addr: str, what: str) -> None:
         raise _bad(f"{what} '{addr}' is not a valid Solana address")
 
 
+def validate_owner(pubkey: str | None, multisig: str | None, required: bool = True) -> tuple[str | None, str | None]:
+    """Exactly one owner; a multisig must really be a Squads multisig account (read on-chain, not cached)."""
+    if pubkey and multisig:
+        raise _bad("send either owner_pubkey or owner_multisig, not both")
+    if not pubkey and not multisig:
+        if required:
+            raise _bad("owner_pubkey or owner_multisig is required: it decides who may sign actions on this strategy")
+        return None, None
+    if pubkey:
+        _check_wallet(pubkey, "owner_pubkey")
+    else:
+        _check_wallet(multisig, "owner_multisig")
+        auth.squads_members(multisig, fresh=True)  # BAD_REQUEST unless it is a Squads multisig account
+    return pubkey, multisig
+
+
 def _owned(st: Strategy | None, org: str) -> Strategy:
     """404 for an unknown id, and for one that belongs to another org (never reveal which)."""
     if st is None or (org and st.org_id and st.org_id != org):
@@ -113,6 +132,8 @@ def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> St
     _check_wallet(body.registered_sender_address, "registered_sender_address")
     return_wallet = body.return_wallet_address or body.registered_sender_address
     _check_wallet(return_wallet, "return_wallet_address")
+    owner_pubkey, owner_multisig = validate_owner(body.owner_pubkey, body.owner_multisig,
+                                                  required=not settings.auth_bypass_active)
 
     size = body.target_exposure_units * Decimal(body.hedge_ratio_bps) / 10_000
     required = required_margin(size, venue().mark_price(body.market_id), body.leverage)
@@ -126,11 +147,14 @@ def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> St
                       market_symbol=m.symbol, hedge_ratio_bps=body.hedge_ratio_bps, leverage=body.leverage,
                       rebalance_band_bps=body.rebalance_band_bps, target_exposure_units=body.target_exposure_units,
                       return_wallet_address=return_wallet, owner_user_id=user, org_id=org,
+                      owner_pubkey=owner_pubkey, owner_multisig=owner_multisig,
                       registered_sender_address=body.registered_sender_address, multisig=multisig,
                       expected_amount_usd=body.expected_amount_usd, required_margin_usd=required,
                       expires_at=now() + timedelta(seconds=ttl_seconds(multisig)))
         s.add(st)
-        s.add(Action(strategy_id=st.id, action="create", record={"intent_id": st.intent_id, "required_margin_usd": str(required)}))
+        s.add(Action(strategy_id=st.id, action="create",
+                     record={"intent_id": st.intent_id, "required_margin_usd": str(required),
+                             "owner_pubkey": owner_pubkey, "owner_multisig": owner_multisig}))
         s.commit()
         s.refresh(st)
         return st
@@ -200,6 +224,41 @@ def get_deposit(sid: str, did: str, org: str = "") -> StrategyDeposit:
         if not dep or dep.strategy_id != sid:
             raise ServiceError("NOT_FOUND", "deposit not found", 404)
         return dep
+
+
+# ---- authorization of mutating actions --------------------------------------
+
+def authorize_action(sid: str, action: str, authorization, params: dict, org: str = "") -> tuple[Strategy, str]:
+    """Load the strategy (404 first, so an unknown id never burns a nonce), then verify the signed message and that the
+    signer owns it. Returns (strategy, who acted)."""
+    st = get_strategy(sid, org)
+    return st, auth.authorize(authorization, action, st, params)
+
+
+def change_owner(sid: str, params: dict, authorization, org: str = "") -> Strategy:
+    """A signed action by the CURRENT owner (or a member of the current owner multisig); attested."""
+    new_pubkey, new_multisig = validate_owner(params.get("owner_pubkey"), params.get("owner_multisig"))
+    st = get_strategy(sid, org)
+    if st.status not in (S_PENDING, S_ACTIVE, S_REBALANCING):  # state first: a refused request must not burn a nonce
+        raise ServiceError("CONFLICT", f"strategy is {st.status}; its owner can no longer be changed", 409)
+    st, signer = authorize_action(sid, "change_owner", authorization, params, org)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        before = {"owner_pubkey": st.owner_pubkey, "owner_multisig": st.owner_multisig}
+        st.owner_pubkey, st.owner_multisig, st.updated_at = new_pubkey, new_multisig, now()
+        s.add(st)
+        s.commit()
+        fund = st.fund_id
+    record = {"event": "change_owner", "from": before, "to": {"owner_pubkey": new_pubkey, "owner_multisig": new_multisig},
+              "signed_by": signer, "authorization_nonce": (authorization or {}).get("nonce"),
+              "authorization_timestamp": (authorization or {}).get("timestamp")}
+    asig = _record_action(sid, "change_owner", record, fund)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        st.last_attestation_sig = asig
+        s.add(st)
+        s.commit()
+    return get_strategy(sid, org)
 
 
 # ---- ledger helpers ---------------------------------------------------------
@@ -329,6 +388,7 @@ def activate(sid: str) -> str:
                 record = {"event": "deploy", "target_size": size, "filled": st.size, "remaining": fill.remaining if fill else 0,
                           "entry_px": st.entry_px, "fee": st.fees_usd, "margin_usd": received, "leverage": st.leverage,
                           "market": state.markets[st.market_id].hl_coin, "mark": v.mark_price(st.market_id),
+                          "owner_pubkey": st.owner_pubkey, "owner_multisig": st.owner_multisig,  # bound at creation
                           "funding_signature": st.deploy_signature, "hl_oids": st.hl_order_ids,
                           "market_closed": v.market_closed.get(st.market_id, False)}
                 fund, oids = st.fund_id, list(st.hl_order_ids)
@@ -536,7 +596,8 @@ def strategy_out(st: Strategy) -> dict:
         "funding_address": funding_address(), "intent_id": st.intent_id,
         "registered_sender_address": st.registered_sender_address, "expected_amount_usd": num(st.expected_amount_usd),
         "received_amount_usd": num(received), "shortfall_usd": num(shortfall), "expires_at": iso(st.expires_at),
-        "owner_user_id": st.owner_user_id, "created_at": iso(st.created_at), "updated_at": iso(st.updated_at),
+        "owner_user_id": st.owner_user_id, "owner_pubkey": st.owner_pubkey, "owner_multisig": st.owner_multisig,
+        "created_at": iso(st.created_at), "updated_at": iso(st.updated_at),
         "deployed_at": iso(st.deployed_at), "closed_at": iso(st.closed_at), "position": position_out(st, mark),
         "market_closed": bool(venue().market_closed.get(st.market_id, False)), "failure_reason": st.failure_reason,
     }

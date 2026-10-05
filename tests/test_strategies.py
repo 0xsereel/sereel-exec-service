@@ -14,14 +14,16 @@ from app.models import Action, ChainTransfer, Strategy, StrategyDeposit, Watcher
 from app.state import state
 from app.strategies import attest as att
 from app.strategies import service, watcher
+from auth_helpers import Signer
 
 D = Decimal
+OWNER = Signer()
 SENDER = str(Keypair().pubkey())
 OTHER = str(Keypair().pubkey())
 M = "XAU-HL"
 # Pyth is mocked at 2650: a 0.12 short = 318 notional, /3x = 106, +20% buffer = 127.2
 BODY = dict(fund_id="fund-1", market_id=M, target_exposure_units=0.2, hedge_ratio_bps=6000, leverage=3, rebalance_band_bps=500,
-            registered_sender_address=SENDER, expected_amount_usd=127.2)
+            registered_sender_address=SENDER, expected_amount_usd=127.2, owner_pubkey=OWNER.pubkey)
 
 
 def create(api, **over):

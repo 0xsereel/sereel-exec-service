@@ -158,6 +158,60 @@ is never rosier than the venue's.
 it to `false` in production: the API then refuses to start unless the database is already at the latest revision, and
 you run `alembic upgrade head` yourself.
 
+## Signed-message authorization and strategy ownership
+
+Strategy actions that move nothing on Solana (edit hedge settings, rebalance, close, return excess, change owner) are
+authorised by a **signed message**, not just the API key. There is no callback to another backend: the strategy itself
+records who may manage it.
+
+**Owner binding.** `POST /strategies` must carry exactly one of:
+- `owner_pubkey`: the manager's Sereel Solana wallet, or
+- `owner_multisig`: the address of a **Squads v4 multisig account** (the account that holds the member list, *not* the
+  vault PDA, which does not contain its members and cannot be traced back to them). The service reads the account
+  on-chain at creation and rejects anything that is not a Squads multisig.
+
+It is stored on the strategy, returned in the strategy object, and included in the creation record and the deploy
+attestation. This is an addition to the v4 create body, so the frontend must send it.
+
+**The message** (Cantina v4 contract):
+
+```
+sereel-strategy-v1|solana|<wallet_pubkey>|<action>|<strategy_id>|<params_hash>|<nonce>|<timestamp_ms>
+```
+
+`params_hash` is the lowercase hex sha256 of the canonical JSON of the action's own params (keys sorted recursively, no
+whitespace, JavaScript `JSON.stringify` rules for primitives, e.g. `520.0` is `520`). The signature is a raw ed25519
+signature over the UTF-8 message, base58. The request carries `authorization: {message, signature, nonce, timestamp,
+publicKey}`. Actions and their params:
+
+| Action | Endpoint | params (exactly the fields sent) |
+|---|---|---|
+| `edit_hedge_settings` | `PATCH /strategies/{id}` | `hedge_ratio_bps`, `target_exposure_units` |
+| `rebalance` | `POST /strategies/{id}/rebalance` | `{}` |
+| `return_excess` | `POST /strategies/{id}/withdrawals` | `amount_usd`, `destination_wallet_address` |
+| `close_strategy` | `DELETE /strategies/{id}` | `destination_wallet_address` |
+| `change_owner` | `POST /strategies/{id}/owner` | one of `owner_pubkey` / `owner_multisig` |
+
+**Verification, on every call.** The server rebuilds the message from the request (it never trusts the client's string),
+verifies the signature, rejects a timestamp more than **60s old** or **30s ahead**, and rejects a nonce it has seen
+(stored in the database, so a restart does not reopen replays; a bad signature never consumes a nonce). Then the signer
+must be the strategy's `owner_pubkey`, or a **current member** of its `owner_multisig` (any member; the Squads account
+is read on-chain and cached for `SQUADS_CACHE_S`, default 60s, so a removed member loses access within a minute). A
+missing `authorization` is `AUTHORIZATION_REQUIRED` (401); anything wrong with it is `AUTHORIZATION_INVALID` (403).
+Deploy and top-up need no signature: the on-chain transfer is their proof.
+
+**Changing the owner** is itself a signed `change_owner` action by the *current* owner (or a member of the current owner
+multisig), and it is attested like any other action. A strategy with no owner bound (one created before this existed)
+cannot be authorised by any signature.
+
+**`DEV_AUTH_BYPASS=true`** skips all of this for local development. It is refused at startup together with
+`ALLOW_MAINNET=true`, is ignored at request time if `ALLOW_MAINNET` is true, prints a banner at startup, and logs a
+`WARNING` on **every** request it lets through. Records made under it say `signed_by: dev-bypass`. Never set it outside
+a dev machine.
+
+*Tested against a real devnet Squads account* (captured in `tests/fixtures/`), not only synthetic data; the account
+layout was checked against Squads' source (`state/multisig.rs`).
+
 ## Error codes
 
 Every non-2xx response body is exactly `{"error": "<human message>", "code": "<CODE>"}`; nothing else. The codes
@@ -171,6 +225,7 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `PRICE_DEVIATION` | 400 | the venue mark differs from the Pyth price by more than MAX_PRICE_DEVIATION_BPS; no order was sent |
 | `INSUFFICIENT_MARGIN` | 400 | not enough margin on the venue (or in the account) for the requested position |
 | `AUTHORIZATION_INVALID` | 403 | the signed-message authorization failed verification (bad signature, wrong params, expired or replayed) |
+| `CHAIN_UNAVAILABLE` | 503 | a Solana read needed for the decision (e.g. a Squads multisig's members) failed |
 | `UNAUTHORIZED` | 401 | missing or invalid X-Sereel-Key |
 | `BAD_REQUEST` | 400 | malformed or invalid input |
 | `NOT_FOUND` | 404 | unknown id or route |
@@ -192,8 +247,8 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `MM_BAD_CONFIG` | n/a | invalid market maker settings |
 
 Notes:
-- **`AUTHORIZATION_REQUIRED` / `AUTHORIZATION_INVALID`** are emitted by the signed-message check on PATCH, rebalance,
-  withdrawals and close (added with those endpoints). A bad or missing `X-Sereel-Key` is `UNAUTHORIZED`, which is
+- **`AUTHORIZATION_REQUIRED` / `AUTHORIZATION_INVALID`** are emitted by the signed-message check (today on
+  `POST /strategies/{id}/owner`; PATCH, rebalance, withdrawals and close use the same check as they are added). A bad or missing `X-Sereel-Key` is `UNAUTHORIZED`, which is
   separate.
 - **There is no `MARKET_CLOSED` code, on purpose.** When Pyth's schedule says the market is closed, the service uses
   the last Pyth price and flags it (`market_closed: true` on the response) instead of failing with `STALE_PRICE`, so

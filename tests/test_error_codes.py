@@ -35,5 +35,5 @@ def test_cantina_special_codes_are_spelled_exactly_and_registered():
 
 def test_the_special_codes_that_exist_today_are_actually_emitted():
     emitted = codes_in_source()
-    for c in ("STALE_PRICE", "PRICE_DEVIATION", "INSUFFICIENT_MARGIN"):
+    for c in ("STALE_PRICE", "PRICE_DEVIATION", "INSUFFICIENT_MARGIN", "AUTHORIZATION_REQUIRED"):
         assert c in emitted, f"{c} is no longer emitted anywhere"

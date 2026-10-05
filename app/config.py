@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     intent_ttl_multisig_seconds: int = 7 * 24 * 3600
 
     allow_mainnet: bool = False
+    dev_auth_bypass: bool = False  # DEV ONLY: skip signed-message authorization. Refused when ALLOW_MAINNET=true.
+    auth_max_age_s: int = 60  # a signed message older than this is rejected
+    auth_future_skew_s: int = 30  # ... and one dated further ahead than this
+    squads_cache_s: int = 60  # how long a multisig's member list is cached
+    squads_program_id: str = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"
     migrate_on_start: bool = True  # run `alembic upgrade head` when the API starts; set false in production
     api_key: str = ""
     cors_origins: str = ""
@@ -68,6 +73,15 @@ class Settings(BaseSettings):
             raise RuntimeError("SOLANA_RPC_URL looks like mainnet; set ALLOW_MAINNET=true to override")
         if not self.is_hl_testnet:
             raise RuntimeError("HL_API_URL is not testnet; set ALLOW_MAINNET=true to override")
+
+    @property
+    def auth_bypass_active(self) -> bool:
+        """The bypass only ever works off mainnet, even if the flag is set."""
+        return self.dev_auth_bypass and not self.allow_mainnet
+
+    def assert_auth_config_safe(self) -> None:
+        if self.dev_auth_bypass and self.allow_mainnet:
+            raise RuntimeError("DEV_AUTH_BYPASS=true is not allowed together with ALLOW_MAINNET=true")
 
     def resolve(self, p: str) -> Path:
         path = Path(p)

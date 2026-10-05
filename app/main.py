@@ -23,6 +23,9 @@ log = logging.getLogger("sereel")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.assert_network_safe()
+    settings.assert_auth_config_safe()
+    if settings.auth_bypass_active:
+        log.warning("=" * 78 + "\n  DEV_AUTH_BYPASS IS ON: signed-message authorization is NOT enforced. DEV ONLY.\n" + "=" * 78)
     if settings.migrate_on_start:
         init_db()
     else:

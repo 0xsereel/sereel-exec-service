@@ -15,6 +15,7 @@ CODES: dict[str, tuple[int, str]] = {
     # --- other signed-authorization failures ---
     "AUTHORIZATION_INVALID": (403, "the signed-message authorization failed verification (bad signature, wrong params, expired or replayed)"),
     # --- generic ---
+    "CHAIN_UNAVAILABLE": (503, "a Solana read needed for the decision (e.g. a Squads multisig's members) failed"),
     "UNAUTHORIZED": (401, "missing or invalid X-Sereel-Key"),
     "BAD_REQUEST": (400, "malformed or invalid input"),
     "NOT_FOUND": (404, "unknown id or route"),

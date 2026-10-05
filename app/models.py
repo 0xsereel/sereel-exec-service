@@ -48,6 +48,9 @@ class Strategy(SQLModel, table=True):
     return_wallet_address: str
     owner_user_id: str = Field(default="", index=True)
     org_id: str = Field(default="", index=True)
+    # who may manage this strategy (signed-message authorization): exactly one is set, bound at creation
+    owner_pubkey: str | None = None  # the manager's Sereel Solana wallet
+    owner_multisig: str | None = None  # a Squads v4 multisig ACCOUNT whose current members may manage it
     failure_reason: str | None = None
 
     # deploy intent
