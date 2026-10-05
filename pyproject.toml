@@ -1,0 +1,26 @@
+[project]
+name = "sereel-exec-service"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi", "uvicorn[standard]", "hyperliquid-python-sdk", "eth-account",
+  "solana", "solders", "httpx", "sqlmodel", "apscheduler", "typer", "rich",
+  "pyyaml", "python-dotenv", "pydantic-settings", "pynacl", "base58",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]"]
+dev = ["pytest"]
+
+[project.scripts]
+sereel = "cli.sereel_cli:app"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
