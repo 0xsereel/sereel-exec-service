@@ -225,17 +225,28 @@ def ledger_drift(s: Session, market_id: str) -> Decimal:
     return diff if abs(diff) >= quantum else Decimal(0)
 
 
+def ledger_cash(s: Session) -> Decimal:
+    """What the strategies are entitled to hold as cash on the venue: credited margin plus realized P&L and funding,
+    minus fees (fees are paid out of the dex balance, so they reduce what is actually there)."""
+    rows = s.exec(select(Strategy).where(Strategy.status.in_(LIVE))).all()
+    return sum((r.margin_usd + r.realized_pnl_usd + r.funding_usd - r.fees_usd for r in rows), Decimal(0))
+
+
+RECONCILE_TOLERANCE = Decimal("0.05")  # rounding and fee timing only; fees themselves are accounted for above
+
+
 def reconcile() -> dict:
-    """The sum of strategy margins must not exceed the cash on the venue's dex balance."""
+    """The strategies' ledger cash must not exceed the cash on the venue's dex balance."""
     with Session(engine) as s:
-        total = sum_margins(s)
+        margins, ledger = sum_margins(s), ledger_cash(s)
     first = next(iter(state.markets))
     pos = venue().position(None, first)
     cash = pos.account_value - pos.unrealized_pnl
-    ok = total <= cash + Decimal(1)  # $1 tolerance for rounding and fee timing
+    ok = ledger <= cash + RECONCILE_TOLERANCE
     if not ok:
-        log.error("RECONCILIATION BREACH: strategy margins %s exceed dex cash %s", total, cash)
-    return {"ok": ok, "sum_strategy_margin_usd": num(total), "dex_cash_usd": num(cash)}
+        log.error("RECONCILIATION BREACH: strategy ledger cash %s exceeds dex cash %s", ledger, cash)
+    return {"ok": ok, "sum_strategy_margin_usd": num(margins), "ledger_cash_usd": num(ledger), "dex_cash_usd": num(cash),
+            "difference_usd": num(cash - ledger)}
 
 
 # ---- refunds ----------------------------------------------------------------
@@ -450,6 +461,7 @@ def expire_due() -> int:
 # ---- serialisation (Cantina v4 shapes) -------------------------------------
 
 _mark_cache: dict[str, tuple[float, Decimal]] = {}
+_liq_cache: dict[str, tuple[float, Decimal | None]] = {}
 
 
 def mark_for(market_id: str) -> Decimal | None:
@@ -464,6 +476,20 @@ def mark_for(market_id: str) -> Decimal | None:
         return None
     _mark_cache[market_id] = (time.time(), mark)
     return mark
+
+
+def venue_liquidation_for(market_id: str) -> Decimal | None:
+    """The venue's own liquidation price for the shared account position (2s cache); None if flat or unavailable."""
+    hit = _liq_cache.get(market_id)
+    if hit and time.time() - hit[0] < 2:
+        return hit[1]
+    try:
+        liq = venue().position(None, market_id).liquidation_px
+    except Exception as e:
+        log.warning("venue liquidation price unavailable for %s: %s", market_id, e)
+        liq = None
+    _liq_cache[market_id] = (time.time(), liq)
+    return liq
 
 
 def position_out(st: Strategy, mark: Decimal | None) -> dict | None:
@@ -482,6 +508,11 @@ def position_out(st: Strategy, mark: Decimal | None) -> dict | None:
     if magnitude:
         liq = (cash + st.entry_px * magnitude) / (magnitude * (1 + rate)) if size < 0 \
             else (st.entry_px * magnitude - cash) / (magnitude * (1 - rate))
+    venue_liq = venue_liquidation_for(st.market_id) if magnitude else None
+    if liq is not None and venue_liq is not None:
+        # the formula above assumes all of the strategy's margin backs the position; the venue's isolated margin can be
+        # smaller. Report the nearer of the two, so the figure is never rosier than the venue's own.
+        liq = min(liq, venue_liq) if size < 0 else max(liq, venue_liq)
     return {"side": "short" if size < 0 else "long" if size > 0 else "flat", "size_units": num(magnitude),
             "entry_price_usd": num(st.entry_px), "mark_price_usd": num(mark), "margin_usd": num(st.margin_usd),
             "unrealized_pnl_usd": num(unrealized), "realized_pnl_usd": num(st.realized_pnl_usd),

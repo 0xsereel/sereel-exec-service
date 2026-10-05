@@ -49,6 +49,7 @@ def rows(model):
 @pytest.fixture(autouse=True)
 def reset_marks():
     service._mark_cache.clear()
+    service._liq_cache.clear()
 
 
 # ---- create / intent --------------------------------------------------------
@@ -537,6 +538,45 @@ def test_position_maths_for_a_short(api, fakechain):
     equity = cash - 6.0
     assert p["margin_health_bps"] == int(10_000 * (equity - p["maintenance_margin_usd"]) / equity)
     assert p["liquidation_price_usd"] == pytest.approx((cash + 2650 * 0.12) / (0.12 * 1.02))  # equity == maintenance there
+
+
+def test_liquidation_price_is_never_rosier_than_the_venues_own(api, fakechain, monkeypatch):
+    s = active(api, fakechain)
+    computed = get(api, s["id"])["position"]["liquidation_price_usd"]
+    real = state.venue.position
+    nearer, further = D(str(computed - 500)), D(str(computed + 500))  # for a short, liquidation is ABOVE entry: lower = nearer
+
+    monkeypatch.setattr(state.venue, "position", lambda *a: _with(real(*a), nearer))  # venue's isolated margin is smaller
+    service._liq_cache.clear()
+    assert get(api, s["id"])["position"]["liquidation_price_usd"] == pytest.approx(float(nearer))  # the venue's nearer figure wins
+    service._liq_cache.clear()
+    monkeypatch.setattr(state.venue, "position", lambda *a: _with(real(*a), further))
+    assert get(api, s["id"])["position"]["liquidation_price_usd"] == pytest.approx(computed)  # ours is nearer: keep ours
+    service._liq_cache.clear()
+    monkeypatch.setattr(state.venue, "position", lambda *a: _with(real(*a), None))
+    assert get(api, s["id"])["position"]["liquidation_price_usd"] == pytest.approx(computed)  # venue gives none: keep ours
+
+
+def _with(p, liq):
+    p.liquidation_px = liq
+    return p
+
+
+def test_reconciliation_accounts_for_fees_instead_of_hiding_them_in_a_tolerance(api, fakechain):
+    s = active(api, fakechain)
+    r = api.get("/health").json()["reconciliation"]
+    fee = get(api, s["id"])["position"]["fees_usd"]
+    assert fee > 0.05  # bigger than the tolerance, so the old "margins <= cash + $1" rule was doing the hiding
+    assert r["sum_strategy_margin_usd"] == 127.2 and r["ledger_cash_usd"] == pytest.approx(127.2 - fee)
+    assert r["dex_cash_usd"] == pytest.approx(r["ledger_cash_usd"], abs=1e-6) and r["difference_usd"] == pytest.approx(0, abs=1e-6)
+    assert r["ok"] is True
+
+
+def test_reconciliation_flags_a_real_shortfall(api, fakechain):
+    active(api, fakechain)
+    state.venue._cash[M] -= D(5)  # money that the ledger believes is there is not
+    r = api.get("/health").json()["reconciliation"]
+    assert r["ok"] is False and r["difference_usd"] == pytest.approx(-5, abs=0.01)
 
 
 def test_health_asserts_leverage_and_reconciles_margin(api, fakechain):

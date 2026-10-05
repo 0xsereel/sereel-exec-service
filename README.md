@@ -36,6 +36,10 @@ have a counterparty on the thin testnet book. It refuses to start unless `HL_API
   `skew_bps` at the inventory limit), and the side that would grow inventory past `max_inventory` is dropped.
 - **Shutdown:** Ctrl-C, SIGTERM or `sereel mm stop` cancels all quotes and flattens the position with a
   **reduce-only IOC**.
+- **Limit of the flatten.** On this testnet the MM is effectively the only liquidity. Once it cancels its quotes the book
+  can be empty, so the flatten may leave residual inventory (seen live: 0.0719 oz long left because no bid existed at
+  any price near the market). That is expected, not a bug: restart the MM and it trades out (long inventory skews its
+  quotes down). The same applies to **closing a strategy: the market maker must be running to take the other side.**
 
 ## Permission model: who can do what
 
@@ -142,8 +146,13 @@ and growing are not. A trade that would flip through zero is not reduce-only.
 and the schedule says the market is closed, the service uses the last Pyth price and sets `market_closed: true`
 instead of failing with `STALE_PRICE`, so the demo works outside gold trading hours.
 
-**Reconciliation.** `/health` reports `reconciliation`: the sum of strategy margins must not exceed the cash on the
-venue's dex balance (a breach is also logged as an error).
+**Reconciliation.** `/health` reports `reconciliation`: the strategies' **ledger cash** (credited margin + realized P&L +
+funding - fees) must not exceed the cash on the venue's dex balance (account value minus unrealized P&L). A breach is
+logged as an error. Fees are accounted for exactly; the tolerance (5 cents) covers rounding only.
+
+**Liquidation price.** `position.liquidation_price_usd` is the nearer of the service's own figure (assuming all of the
+strategy's margin backs the position) and the venue's reported liquidation price for the shared account position, so it
+is never rosier than the venue's.
 
 **Migrations on start.** `MIGRATE_ON_START` (default `true`) makes the API run `alembic upgrade head` at startup. Set
 it to `false` in production: the API then refuses to start unless the database is already at the latest revision, and
