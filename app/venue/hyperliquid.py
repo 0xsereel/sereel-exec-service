@@ -170,6 +170,30 @@ class HyperliquidVenue(VenueAdapter):
         if m.hl_dex and not is_unified(self.mode):
             self._transfer(m.hl_dex, "", Decimal(usd_amount))
 
+    def withdraw_to_arbitrum(self, amount_usd: Decimal, destination: str | None = None) -> dict:
+        """Withdraw USDC from the main perp balance through the Hyperliquid bridge to Arbitrum (Sepolia on testnet).
+
+        Signed by the MASTER key: API wallets cannot withdraw. Hyperliquid charges a flat fee (about $1) and the
+        funds land on Arbitrum after validators sign, typically within minutes. Pass destination to override the
+        default (the master's own address).
+        """
+        if not self._master_exchange:
+            raise ServiceError("WITHDRAW_NOT_AUTHORIZED", "withdrawals need the master key (HL_MASTER_KEY in dev)", 503)
+        amount = Decimal(amount_usd)
+        main = Decimal(self.info.user_state(self.master)["withdrawable"])
+        if amount > main:
+            raise ServiceError("WITHDRAW_BELOW_MARGIN", f"withdrawable on the main perp balance is {main}, asked for {amount}")
+        res = self._master_exchange.withdraw_from_bridge(float(amount), destination or self.master)
+        if res.get("status") != "ok":
+            raise ServiceError("WITHDRAW_FAILED", f"bridge withdrawal rejected: {res}")
+        return res
+
+    def withdrawals_since(self, since_ms: int) -> list[dict]:
+        """Ledger entries of type 'withdraw' for the master (hash, nonce, amount, fee), for confirmation."""
+        return [u for u in self.info.post("/info", {"type": "userNonFundingLedgerUpdates", "user": self.master,
+                                                    "startTime": since_ms})
+                if u["delta"].get("type") == "withdraw"]
+
     # -- orders ---------------------------------------------------------------
     @staticmethod
     def _round_px(px: Decimal, sz_decimals: int) -> float:

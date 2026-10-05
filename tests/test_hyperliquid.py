@@ -54,6 +54,12 @@ class FakeExchange:
     def cancel(self, coin, oid):
         self.cancelled.append(oid)
 
+    def withdraw_from_bridge(self, amount, destination):
+        self.withdrawn = (amount, destination)
+        return self.withdraw_result
+
+    withdraw_result = {"status": "ok", "response": {"type": "default"}}
+
     def send_asset(self, dest, src, dst, token, amount):
         self.sent.append((dest, src, dst, token, amount))
         return {"status": "ok"}
@@ -189,3 +195,29 @@ def test_account_mode_detection():
     assert account_mode(I("unifiedAccount"), "0xa") == "unifiedAccount"
     assert is_unified("unifiedAccount") and is_unified("portfolioMargin")
     assert not is_unified("default") and not is_unified("dexAbstraction") and not is_unified("disabled")
+
+
+def test_withdraw_signs_with_master_to_own_address_by_default():
+    v = venue()
+    assert v.withdraw_to_arbitrum(D(10))["status"] == "ok"
+    assert v._master_exchange.withdrawn == (10.0, "0xme") and not hasattr(v.exchange, "withdrawn")  # never the agent
+
+
+def test_withdraw_explicit_destination_and_limits():
+    v = venue()
+    v.withdraw_to_arbitrum(D(5), "0xother")
+    assert v._master_exchange.withdrawn == (5.0, "0xother")
+    with pytest.raises(ServiceError) as e:
+        v.withdraw_to_arbitrum(D(501))  # main perp withdrawable is 500
+    assert e.value.code == "WITHDRAW_BELOW_MARGIN"
+
+
+def test_withdraw_needs_master_key_and_surfaces_rejection():
+    with pytest.raises(ServiceError) as e:
+        venue(master=False).withdraw_to_arbitrum(D(10))
+    assert e.value.code == "WITHDRAW_NOT_AUTHORIZED"
+    v = venue()
+    v._master_exchange.withdraw_result = {"status": "err", "response": "Insufficient balance"}
+    with pytest.raises(ServiceError) as e:
+        v.withdraw_to_arbitrum(D(10))
+    assert e.value.code == "WITHDRAW_FAILED" and "Insufficient" in e.value.message
