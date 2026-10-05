@@ -61,6 +61,7 @@ class VenueAdapter(ABC):
 
     def __init__(self, markets: dict[str, Market]):
         self.markets = markets
+        self.market_closed: dict[str, bool] = {}  # last Pyth reference was a closed-market (flagged) price
 
     def market(self, market_id: str) -> Market:
         try:
@@ -84,7 +85,8 @@ class VenueAdapter(ABC):
     def size_decimals(self, market_id: str) -> int: ...
 
     @abstractmethod
-    def _ioc(self, market_id: str, is_buy: bool, size: Decimal, limit_px: Decimal) -> tuple[Decimal | None, str | None]:
+    def _ioc(self, market_id: str, is_buy: bool, size: Decimal, limit_px: Decimal,
+             reduce_only: bool = False) -> tuple[Decimal | None, str | None]:
         """Send one IOC order; return (reported avg px, oid). The caller measures the real fill from the position."""
 
     @abstractmethod
@@ -93,6 +95,16 @@ class VenueAdapter(ABC):
     def release_margin(self, market_id: str, usd_amount: Decimal) -> None:
         """Move USDC from the market's dex balance back to the main balance (withdrawal path)."""
         raise NotImplementedError
+
+    def prepare_market(self, market_id: str) -> None:
+        """Called inside the account lock before the first order of every set_position (e.g. set leverage)."""
+
+    def leverage_status(self, market_id: str) -> dict | None:
+        """{"leverage": int, "mode": "isolated"|"cross"} as the venue reports it, or None if unknown."""
+        return None
+
+    def maintenance_rate(self, market_id: str) -> Decimal:
+        return Decimal("0.02")
 
     def funding_since(self, market_id: str, since_ms: int) -> Decimal:
         return Decimal(0)
@@ -105,7 +117,9 @@ class VenueAdapter(ABC):
         """Reject on stale Pyth or venue-mark/Pyth deviation beyond MAX_PRICE_DEVIATION_BPS."""
         m = self.market(market_id)
         mark = self.mark_price(market_id)
-        ref = pyth.get_price(m.pyth_feed_id, m.max_staleness_s).price
+        quote = pyth.get_price(m.pyth_feed_id, m.max_staleness_s, symbol=m.symbol)
+        self.market_closed[market_id] = quote.market_closed
+        ref = quote.price
         dev_bps = abs(mark - ref) / ref * 10_000
         if dev_bps > settings.max_price_deviation_bps:
             raise ServiceError("PRICE_DEVIATION", f"{self.name} mark {mark} vs Pyth {ref}: {dev_bps:.0f}bps")
@@ -122,6 +136,7 @@ class VenueAdapter(ABC):
         q = Decimal(1).scaleb(-self.size_decimals(market_id))
         report = FillReport(market_id=market_id, requested=delta, remaining=delta)
         with account_lock(self.account_key):
+            self.prepare_market(market_id)  # e.g. leverage is set before the first order, never after
             mark = self.check_price(market_id)
             if abs(delta) < q:
                 report.position_after = self.position(strategy_id, market_id)
@@ -135,9 +150,11 @@ class VenueAdapter(ABC):
                 if size == 0:
                     break
                 is_buy = gap > 0
+                # closes and rebalance-downs only ever shrink the account position: send those reduce-only
+                reduce_only = before != 0 and (before > 0) != is_buy and size <= abs(before)
                 mark = self.mark_price(market_id)
                 limit = mark * (1 + slippage if is_buy else 1 - slippage)
-                avg_px, oid = self._ioc(market_id, is_buy, size, limit)
+                avg_px, oid = self._ioc(market_id, is_buy, size, limit, reduce_only)
                 got = self.position(strategy_id, market_id).size - before
                 report.partials.append(Partial(attempt, limit, got, avg_px, oid))
                 if oid:

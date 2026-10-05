@@ -55,12 +55,33 @@ def test_downgrade_to_base_removes_everything(eng):
     assert tables(eng) <= {"alembic_version"}
 
 
-def test_legacy_create_all_database_is_stamped_not_recreated(eng):
-    """A database from before Alembic (tables, no alembic_version) must upgrade in place, keeping its rows."""
-    SQLModel.metadata.create_all(eng)
-    with eng.begin() as c:
-        c.execute(text("INSERT INTO usednonce (nonce, created_at) VALUES ('legacy', '2026-01-01 00:00:00')"))
+def test_legacy_pre_alembic_database_is_stamped_not_recreated(eng):
+    """A database from before Alembic (baseline-era tables, no alembic_version) must upgrade in place, keeping its rows.
+    It is built the way it really was: the baseline schema, with the version table removed."""
+    with eng.begin() as conn:
+        command.upgrade(_config(conn), "baseline")
+        conn.execute(text("DROP TABLE alembic_version"))
+        conn.execute(text("INSERT INTO usednonce (nonce, created_at) VALUES ('legacy', '2026-01-01 00:00:00')"))
+    init_db(eng)  # stamps baseline, then upgrades through every later revision
+    with eng.connect() as c:
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == ScriptDirectory.from_config(
+            _config(None)).get_current_head()
+        assert c.execute(text("SELECT nonce FROM usednonce")).scalar() == "legacy"
+        assert "activation_attempts" in {col["name"] for col in inspect(c).get_columns("strategy")}  # later revisions applied
+
+
+def test_0002_upgrades_a_baseline_database_that_already_has_strategies(eng):
+    """The NOT NULL columns added after the baseline must not break rows that exist before the upgrade."""
+    with eng.begin() as conn:
+        command.upgrade(_config(conn), "baseline")
+        conn.execute(text(
+            "INSERT INTO strategy (id, template, status, fund_id, fund_name, market_id, market_symbol, hedge_ratio_bps, leverage,"
+            " rebalance_band_bps, target_exposure_units, return_wallet_address, owner_user_id, org_id, intent_id,"
+            " registered_sender_address, multisig, expected_amount_usd, expires_at, margin_usd, size, entry_px, realized_pnl_usd,"
+            " fees_usd, funding_usd, funding_cursor_ms, hl_order_ids, created_at, updated_at)"
+            " VALUES ('s1','delta_neutral_hedge','active','f','','XAU-HL','XAU',6000,3,500,1,'w','','','i1','sender',0,100,"
+            " '2026-01-01 00:00:00',0,0,0,0,0,0,0,'[]','2026-01-01 00:00:00','2026-01-01 00:00:00')"))
     init_db(eng)
     with eng.connect() as c:
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == BASELINE
-        assert c.execute(text("SELECT nonce FROM usednonce")).scalar() == "legacy"
+        row = c.execute(text("SELECT required_margin_usd, activation_attempts FROM strategy WHERE id='s1'")).one()
+    assert (float(row[0]), row[1]) == (0.0, 0)

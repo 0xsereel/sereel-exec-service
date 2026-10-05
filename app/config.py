@@ -34,12 +34,15 @@ class Settings(BaseSettings):
     rebalance_band_pct: Decimal = Decimal(5)
     max_price_deviation_bps: Decimal = Decimal(200)
     ioc_max_retries: int = 3
+    max_activation_attempts: int = 12  # watcher ticks (5s) to keep retrying a funded strategy's first order before refunding
+    rebalance_tolerance_pct: Decimal = Decimal(2)  # create: expected_amount_usd may be this far below the computed requirement
     mm_min_size: Decimal = Decimal("0.02")  # market maker per-level order size bounds (coin units)
     mm_max_size: Decimal = Decimal("0.05")
     intent_ttl_seconds: int = 3600
     intent_ttl_multisig_seconds: int = 7 * 24 * 3600
 
     allow_mainnet: bool = False
+    migrate_on_start: bool = True  # run `alembic upgrade head` when the API starts; set false in production
     api_key: str = ""
     cors_origins: str = ""
     database_url: str = "sqlite:///./service.db"

@@ -55,9 +55,11 @@ class Strategy(SQLModel, table=True):
     registered_sender_address: str = Field(index=True)
     multisig: bool = False
     expected_amount_usd: Decimal = money()
+    required_margin_usd: Decimal = money()  # notional / leverage * (1 + buffer), frozen when the strategy was created
     received_amount_usd: Decimal | None = nullable_money()
     expires_at: datetime
-    deploy_signature: str | None = None  # inbound transfer that activated the strategy
+    deploy_signature: str | None = None  # inbound transfer that completed the funding
+    activation_attempts: int = 0  # funded, but the first order has not gone through yet
 
     # per-strategy ledger on the shared venue account
     margin_usd: Decimal = money()  # credited margin (deposits + excess)
@@ -100,7 +102,8 @@ class ChainTransfer(SQLModel, table=True):
     amount_usd: Decimal = money()
     memo: str | None = None
     intent_id: str | None = None
-    disposition: str  # credited | partial | refunded | ignored_own | refund_failed
+    disposition: str  # processing | credited | refunded | ignored_own | refund_failed | refund_unconfirmed
+    note: str | None = None  # why it was refunded / why a refund failed
     refund_signature: str | None = None
     attestation_sig: str | None = None
     created_at: datetime = Field(default_factory=now)

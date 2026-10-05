@@ -16,6 +16,7 @@ class FakeInfo:
         self.dex_value = "100.0"
         self.main_withdrawable = "500.0"
         self.spot = "300.0"
+        self.leverage = {"type": "cross", "value": 20}
 
     def user_state(self, addr, dex=""):
         if dex == "":
@@ -27,6 +28,8 @@ class FakeInfo:
     def post(self, path, body):
         if body["type"] == "userAbstraction":
             return "default"
+        if body["type"] == "activeAssetData":
+            return {"leverage": dict(self.leverage) if self.leverage else {}}
         return {"universe": [{"name": "xyz:GOLD"}]}, [{"markPx": "2651.5", "oraclePx": "2640.0"}]
 
     def spot_user_state(self, addr):
@@ -47,9 +50,21 @@ class FakeExchange:
     def __init__(self, status):
         self.status, self.calls, self.cancelled, self.sent = status, [], [], []
 
-    def order(self, coin, is_buy, sz, px, otype):
-        self.calls.append((coin, is_buy, sz, px, otype))
+    def order(self, coin, is_buy, sz, px, otype, reduce_only=False):
+        self.calls.append((coin, is_buy, sz, px, otype, reduce_only))
         return {"status": "ok", "response": {"data": {"statuses": [self.status]}}}
+
+    def update_leverage(self, leverage, coin, is_cross=True):
+        self.lev_calls = getattr(self, "lev_calls", []) + [(leverage, coin, is_cross)]
+        if self.lev_reject_isolated and not is_cross:
+            return {"status": "err", "response": "isolated margin not supported"}
+        if self.lev_noop:
+            return {"status": "ok"}  # accepted but the venue does not actually change (simulates a mismatch)
+        self.info.leverage = {"type": "cross" if is_cross else "isolated", "value": leverage}
+        return {"status": "ok"}
+
+    lev_reject_isolated = False
+    lev_noop = False
 
     def cancel(self, coin, oid):
         self.cancelled.append(oid)
@@ -70,8 +85,10 @@ def venue(status=None, master=True):
     v.markets, v.master, v.account_key = load_markets(), "0xme", "0xme"
     v.info, v._sz_dec, v.asset_ids = FakeInfo(), {M: 4}, {M: 750003}
     v.mode = "default"
+    v._max_lev = {M: 25}
     v.exchange = FakeExchange(status or {"filled": {"avgPx": "2650", "oid": 7, "totalSz": "0.1"}})
     v._master_exchange = FakeExchange({}) if master else None
+    v.exchange.info = v.info
     return v
 
 
@@ -98,8 +115,8 @@ def test_fees_use_actual_fills_for_the_orders_only():
 def test_ioc_filled_sends_ioc_with_rounded_price():
     v = venue()
     assert v._ioc(M, False, D("0.6"), D("2637.2518")) == (D(2650), "7")
-    coin, is_buy, sz, px, otype = v.exchange.calls[0]
-    assert (coin, is_buy, sz, px, otype) == ("xyz:GOLD", False, 0.6, 2637.3, {"limit": {"tif": "Ioc"}})
+    coin, is_buy, sz, px, otype, reduce_only = v.exchange.calls[0]
+    assert (coin, is_buy, sz, px, otype, reduce_only) == ("xyz:GOLD", False, 0.6, 2637.3, {"limit": {"tif": "Ioc"}}, False)
 
 
 def test_ioc_no_cross_is_zero_fill_not_error():
@@ -221,3 +238,39 @@ def test_withdraw_needs_master_key_and_surfaces_rejection():
     with pytest.raises(ServiceError) as e:
         v.withdraw_to_arbitrum(D(10))
     assert e.value.code == "WITHDRAW_FAILED" and "Insufficient" in e.value.message
+
+
+def test_leverage_is_set_isolated_first_and_verified_by_reading_back():
+    v = venue()
+    assert v.leverage_status(M) == {"leverage": 20, "mode": "cross"}
+    got = v.ensure_leverage(M)
+    assert got == {"leverage": 3, "mode": "isolated"} and v.exchange.lev_calls == [(3, "xyz:GOLD", False)]
+
+
+def test_leverage_falls_back_to_cross_when_isolated_is_rejected():
+    v = venue()
+    v.exchange.lev_reject_isolated = True
+    assert v.ensure_leverage(M) == {"leverage": 3, "mode": "cross"}
+    assert [c[2] for c in v.exchange.lev_calls] == [False, True]
+
+
+def test_leverage_already_correct_sends_nothing():
+    v = venue()
+    v.info.leverage = {"type": "isolated", "value": 3}
+    v.ensure_leverage(M)
+    assert not hasattr(v.exchange, "lev_calls")
+
+
+def test_unconfirmed_leverage_blocks_trading_with_its_own_code():
+    v = venue()
+    v.exchange.lev_noop = True  # venue says ok but leverage stays 20x
+    with pytest.raises(ServiceError) as e:
+        v.ensure_leverage(M)
+    assert e.value.code == "LEVERAGE_NOT_SET" and e.value.code != "INSUFFICIENT_MARGIN"
+    with pytest.raises(ServiceError):
+        v.prepare_market(M)
+    assert v.exchange.calls == []  # no order was sent
+
+
+def test_maintenance_rate_is_one_over_twice_max_leverage():
+    assert venue().maintenance_rate(M) == D("0.02")

@@ -90,3 +90,104 @@ Postgres-ready (`pip install -e ".[postgres]"`, `DATABASE_URL=postgresql+psycopg
 - A database created before Alembic was added (tables present, no `alembic_version`) is stamped at the baseline and
   upgraded in place, keeping its rows.
 - Roll back with `alembic downgrade -1` (or `base`). Back up the database first.
+
+## Strategies and funding intents
+
+A strategy is a delta-neutral hedge: the service shorts `target_exposure_units x hedge_ratio` of the market on the
+venue against a fund's exposure. Funding is by **intent**; the client never submits a signature.
+
+1. `POST /strategies` registers the strategy and its intent: status `pending_funding`, with `intent_id`,
+   `funding_address` and `expires_at`. It is rejected (400) if `expected_amount_usd` is more than 2% below the required
+   margin, which the service computes itself: `short size x price / leverage x (1 + MARGIN_BUFFER_PCT)`.
+2. The client sends a stablecoin transfer to the (single, global) funding address with an SPL **Memo that is exactly the
+   `intent_id`**, from the `registered_sender_address` (the wallet itself, or the Squads vault PDA for a multisig).
+3. The **deposit watcher** (every 5s) reads **finalized** transactions only and applies these rules:
+
+| Transfer | Result |
+|---|---|
+| memo = intent **and** sender = registered sender, intent open | credited. Under: stays `pending_funding`, `received_amount_usd` and `shortfall_usd` shown, later transfers add up. Exact or over: activates, and the excess is margin. |
+| anything else: no memo, unknown memo, **wrong sender**, intent cancelled / expired / already active | **refunded to its sender and attested**, never credited |
+| from the service's own addresses (funding, attest, payment source, mint authority) | ignored |
+
+   Expiry is 1 hour for a wallet and 7 days for a multisig vault (a Squads vault is a PDA, i.e. off the ed25519 curve,
+   so no hint field is needed). A deposit that finalizes after expiry or cancel is refunded; partial funding is
+   refunded when an intent expires or is cancelled.
+4. **Activation**: margin is raised on the venue, leverage is set (see below), and the short is opened with IOC orders.
+   Transient failures (price deviation, stale price, no fill) are retried every tick up to `MAX_ACTIVATION_ATTEMPTS`;
+   after that the strategy is `failed` and the funding is refunded. A partial fill activates with the size actually
+   filled. Activation is **held, not failed**, if the venue position differs from the ledger by more than one size
+   step (a position the ledger cannot explain): trading on top of it would compound the error.
+5. Every deploy, deposit and refund is attested: an SPL memo `{"v":1,"id","fund","a":<action>,"net","h":<sha256 of the
+   full record>}`; the full record is in the database (`action` table).
+
+`POST /strategies/{id}/deposits` (top-up) uses the same mechanism with its own `intent_id`, credits margin only
+(no trade), and `POST /strategies/{id}/cancel` cancels a pending intent (409 once it is active, expired or cancelled).
+Tenant scoping: send `X-Sereel-Org` and `X-Sereel-User`; another org's strategy is a 404.
+
+**Watcher guarantees.** The cursor (newest finalized signature fully processed) is stored in the database and the
+baseline is taken at API startup, before any intent can exist, so a restart neither skips nor repeats a transfer and
+old wallet history is never mistaken for a deposit. Each transfer is claimed in the database (primary key) before
+anything is done with it, so none is credited or refunded twice, even with two workers. A transfer left half-handled
+by a crash is marked `refund_unconfirmed` and **never retried automatically**; `/health` reports
+`unresolved_transfers` (failed or unconfirmed refunds), which need a person.
+
+**Leverage.** Before the first order the service sets the market to `max_leverage` from `markets.yaml` (3x):
+isolated if the venue accepts it, else cross, verified by reading it back (`LEVERAGE_NOT_SET` and no order if it cannot
+be confirmed). `/health` asserts it: `hyperliquid.leverage.<market> = {configured, actual, mode, ok}`.
+
+**Reduce-only.** An order that only shrinks the account position (closes, rebalance-downs) is sent reduce-only; opening
+and growing are not. A trade that would flip through zero is not reduce-only.
+
+**Closed markets.** Pyth feeds carry a market-hours `schedule` (timezone, weekly hours, holidays). If the price is stale
+and the schedule says the market is closed, the service uses the last Pyth price and sets `market_closed: true`
+instead of failing with `STALE_PRICE`, so the demo works outside gold trading hours.
+
+**Reconciliation.** `/health` reports `reconciliation`: the sum of strategy margins must not exceed the cash on the
+venue's dex balance (a breach is also logged as an error).
+
+**Migrations on start.** `MIGRATE_ON_START` (default `true`) makes the API run `alembic upgrade head` at startup. Set
+it to `false` in production: the API then refuses to start unless the database is already at the latest revision, and
+you run `alembic upgrade head` yourself.
+
+## Error codes
+
+Every non-2xx response body is exactly `{"error": "<human message>", "code": "<CODE>"}`; nothing else. The codes
+below are all of them (registry: `app/errors.py`; a test keeps this table, the registry and the source in step).
+Cantina handles the first four specially, so their spelling is fixed.
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `AUTHORIZATION_REQUIRED` | 401 | a signed-message `authorization` is missing on a call that needs one |
+| `STALE_PRICE` | 503 | the Pyth price is older than the market's max_staleness_s while the market is open, or Pyth is unreachable |
+| `PRICE_DEVIATION` | 400 | the venue mark differs from the Pyth price by more than MAX_PRICE_DEVIATION_BPS; no order was sent |
+| `INSUFFICIENT_MARGIN` | 400 | not enough margin on the venue (or in the account) for the requested position |
+| `AUTHORIZATION_INVALID` | 403 | the signed-message authorization failed verification (bad signature, wrong params, expired or replayed) |
+| `UNAUTHORIZED` | 401 | missing or invalid X-Sereel-Key |
+| `BAD_REQUEST` | 400 | malformed or invalid input |
+| `NOT_FOUND` | 404 | unknown id or route |
+| `CONFLICT` | 409 | the request conflicts with the current state (e.g. cancelling an already active strategy) |
+| `HTTP_ERROR` | n/a | any other HTTP error (the status is the HTTP status of the error, e.g. 405) |
+| `INTERNAL` | 500 | unexpected error (details are logged, never returned) |
+| `NOT_CONFIGURED` | 503 | a required setting is missing (e.g. STABLECOIN_MINT) |
+| `UNKNOWN_MARKET` | 404 | the market id is not in markets.yaml (or not found on the venue) |
+| `ORDER_NOT_FILLED` | 400 | no fill after the IOC retries, or the venue rejected the order |
+| `LEVERAGE_NOT_SET` | 503 | the venue did not confirm the configured leverage for the market, so no order was sent |
+| `VENUE_NOT_CONFIGURED` | 503 | Hyperliquid credentials are not set |
+| `PRICE_SOURCE_AUTH` | 502 | Pyth Hermes rejected the credentials (PYTH_API_KEY) |
+| `WITHDRAW_BELOW_MARGIN` | 400 | the withdrawal would leave the strategy below its required margin, or exceeds the withdrawable balance |
+| `WITHDRAW_NOT_AUTHORIZED` | 503 | withdrawing needs the master key, which is not configured |
+| `WITHDRAW_FAILED` | 400 | the bridge rejected the withdrawal |
+| `PAYMENT_FAILED` | 502 | the Solana payout failed |
+| `MM_MAINNET_REFUSED` | n/a | the market maker refuses to run unless HL_API_URL is testnet |
+| `MM_SIZE_OUT_OF_RANGE` | n/a | market maker order size outside MM_MIN_SIZE..MM_MAX_SIZE |
+| `MM_BAD_CONFIG` | n/a | invalid market maker settings |
+
+Notes:
+- **`AUTHORIZATION_REQUIRED` / `AUTHORIZATION_INVALID`** are emitted by the signed-message check on PATCH, rebalance,
+  withdrawals and close (added with those endpoints). A bad or missing `X-Sereel-Key` is `UNAUTHORIZED`, which is
+  separate.
+- **There is no `MARKET_CLOSED` code, on purpose.** When Pyth's schedule says the market is closed, the service uses
+  the last Pyth price and flags it (`market_closed: true` on the response) instead of failing with `STALE_PRICE`, so
+  the demo works outside gold trading hours. `STALE_PRICE` therefore means "the market is open but the price is old,
+  or Pyth is unreachable". The `PRICE_DEVIATION` check still applies against that last price.
+- `UNKNOWN_MARKET` is 404 from the venue lookup and 400 when a request names an unknown market in its body.

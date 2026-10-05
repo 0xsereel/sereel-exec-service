@@ -133,3 +133,36 @@ def test_funding_routes():
     assert MirroredRoute().to_venue(D(5), "r")["route"] == "mirrored"
     with pytest.raises(NotImplementedError):
         CctpHyperliquidRoute().to_venue(D(5), "r")
+
+
+def test_closing_and_shrinking_use_reduce_only_but_opening_and_growing_do_not():
+    v = venue()
+    v.set_position("s", M, D("-1"))  # open short
+    v.set_position("s", M, D("-1.5"), current_size=D("-1"))  # grow
+    v.set_position("s", M, D("-1"), current_size=D("-1.5"))  # shrink (buy 0.5)
+    v.set_position("s", M, D(0), current_size=D("-1"))  # close (buy 1)
+    assert [(o["is_buy"], o["reduce_only"]) for o in v.orders] == [(False, False), (False, False), (True, True), (True, True)]
+
+
+def test_flipping_through_zero_is_not_reduce_only():
+    v = venue()
+    v.set_position("s", M, D("-1"))
+    v.set_position("s", M, D("0.5"), current_size=D("-1"))  # buy 1.5 against a 1.0 short: would flip the position
+    assert v.orders[-1]["reduce_only"] is False
+
+
+def test_prepare_market_sets_leverage_before_the_first_order():
+    v = venue()
+    assert v.leverage_status(M) == {"leverage": 20, "mode": "cross"}
+    v.set_position("s", M, D("-1"))
+    assert v.leverage_status(M) == {"leverage": 3, "mode": "isolated"}
+
+
+def test_market_closed_flag_is_recorded_when_pyth_serves_a_closed_price(monkeypatch):
+    from app.pyth import PythPrice
+
+    monkeypatch.setattr(pyth, "get_price", lambda *a, **k: PythPrice(D(2650), 0, "f", market_closed=True))
+    v = venue()
+    v.price_override[M] = D(2650)
+    v.set_position("s", M, D("-1"))
+    assert v.market_closed[M] is True  # traded on the last price, flagged

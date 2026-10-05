@@ -50,5 +50,18 @@ def init_db(eng=None) -> None:
         command.upgrade(cfg, "head")
 
 
+def check_db_at_head(eng=None) -> None:
+    """For MIGRATE_ON_START=false: refuse to run against a database that is not at the latest migration."""
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(_config(None)).get_current_head()
+    with (eng or engine).connect() as conn:
+        current = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar() \
+            if "alembic_version" in inspect(conn).get_table_names() else None
+    if current != head:
+        raise RuntimeError(f"database is at revision {current!r} but the code expects {head!r}; "
+                           "run `alembic upgrade head` (MIGRATE_ON_START=false)")
+
+
 def session() -> Session:
     return Session(engine)

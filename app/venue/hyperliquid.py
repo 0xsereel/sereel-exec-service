@@ -50,6 +50,7 @@ class HyperliquidVenue(VenueAdapter):
                                  if settings.hl_master_key else None)
         self.asset_ids: dict[str, int] = {}
         self._sz_dec: dict[str, int] = {}
+        self._max_lev: dict[str, int] = {}
         self.resolve_markets()
         self.mode = account_mode(self.info, self.master)
         log.info("master account abstraction: %s", self.mode)
@@ -81,10 +82,45 @@ class HyperliquidVenue(VenueAdapter):
                 raise ServiceError("UNKNOWN_MARKET", f"asset id mismatch for {m.hl_coin}: computed {asset}, SDK {sdk_asset}", 500)
             self.asset_ids[mid] = asset
             self._sz_dec[mid] = int(meta["universe"][idx]["szDecimals"])
+            self._max_lev[mid] = int(meta["universe"][idx]["maxLeverage"])
 
     def size_decimals(self, market_id):
         self.market(market_id)
         return self._sz_dec[market_id]
+
+    def maintenance_rate(self, market_id):
+        """Hyperliquid maintenance margin is 1 / (2 * the asset's max leverage)."""
+        self.market(market_id)
+        return Decimal(1) / (2 * self._max_lev[market_id])
+
+    # -- leverage -------------------------------------------------------------
+    def leverage_status(self, market_id):
+        m = self.market(market_id)
+        d = self.info.post("/info", {"type": "activeAssetData", "user": self.master, "coin": m.hl_coin})
+        lev = d.get("leverage") or {}
+        return {"leverage": int(lev["value"]), "mode": lev["type"]} if lev else None
+
+    def ensure_leverage(self, market_id) -> dict:
+        """Set the market to its configured leverage: isolated if the dex accepts it, else cross. Idempotent, and
+        verified by reading the setting back, so we never trade on a leverage we did not confirm."""
+        m = self.market(market_id)
+        want = m.max_leverage
+        cur = self.leverage_status(market_id)
+        if cur and cur["leverage"] == want:
+            return cur
+        for is_cross in (False, True):  # isolated first (HIP-3 dexes allow it), cross as the fallback
+            res = self.exchange.update_leverage(want, m.hl_coin, is_cross=is_cross)
+            if res.get("status") == "ok":
+                break
+            log.warning("update_leverage(%sx, %s) rejected: %s", want, "cross" if is_cross else "isolated", res)
+        got = self.leverage_status(market_id)
+        if not got or got["leverage"] != want:
+            raise ServiceError("LEVERAGE_NOT_SET", f"could not set {m.hl_coin} to {want}x (venue reports {got}); no order sent", 503)
+        log.info("%s leverage set: %sx %s", m.hl_coin, got["leverage"], got["mode"])
+        return got
+
+    def prepare_market(self, market_id):
+        self.ensure_leverage(market_id)
 
     # -- reads ----------------------------------------------------------------
     def oracle_price(self, market_id) -> Decimal:
@@ -200,10 +236,10 @@ class HyperliquidVenue(VenueAdapter):
         """Perps: at most 5 significant figures and at most (6 - szDecimals) decimals."""
         return round(float(f"{float(px):.5g}"), 6 - sz_decimals)
 
-    def _ioc(self, market_id, is_buy, size, limit_px):
+    def _ioc(self, market_id, is_buy, size, limit_px, reduce_only=False):
         m = self.market(market_id)
         res = self.exchange.order(m.hl_coin, is_buy, float(size), self._round_px(limit_px, self._sz_dec[market_id]),
-                                  {"limit": {"tif": "Ioc"}})
+                                  {"limit": {"tif": "Ioc"}}, reduce_only)
         if res.get("status") != "ok":
             raise ServiceError("ORDER_NOT_FILLED", f"order rejected: {res}")
         st = res["response"]["data"]["statuses"][0]

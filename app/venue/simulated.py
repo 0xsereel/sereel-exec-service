@@ -25,6 +25,8 @@ class SimulatedVenue(VenueAdapter):
         self._fees: dict[str, Decimal] = {}
         self._oid = itertools.count(1)
         self.price_override: dict[str, Decimal] = {}
+        self._lev: dict[str, dict] = {}
+        self.orders: list[dict] = []  # every order sent, for tests
 
     def size_decimals(self, market_id):
         return 4
@@ -33,6 +35,12 @@ class SimulatedVenue(VenueAdapter):
         if market_id in self.price_override:
             return self.price_override[market_id]
         return pyth.get_price(self.market(market_id).pyth_feed_id, None).price
+
+    def leverage_status(self, market_id):
+        return self._lev.get(market_id, {"leverage": 20, "mode": "cross"})  # the venue default before we set it
+
+    def prepare_market(self, market_id):
+        self._lev[market_id] = {"leverage": self.market(market_id).max_leverage, "mode": "isolated"}
 
     def position(self, strategy_id, market_id):
         mark = self.mark_price(market_id)
@@ -56,7 +64,8 @@ class SimulatedVenue(VenueAdapter):
         self._cash[market_id] = self._cash.get(market_id, Decimal(0)) - usd_amount
         self.funds += usd_amount
 
-    def _ioc(self, market_id, is_buy, size, limit_px):
+    def _ioc(self, market_id, is_buy, size, limit_px, reduce_only=False):
+        self.orders.append({"market": market_id, "is_buy": is_buy, "size": size, "reduce_only": reduce_only})
         mark = self.mark_price(market_id)
         if (is_buy and limit_px < mark) or (not is_buy and limit_px > mark):
             return None, None  # limit not marketable: IOC cancels with zero fill
