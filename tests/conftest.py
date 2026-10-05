@@ -51,7 +51,8 @@ class FakeChain:
         self.refunds, self.memos = [], []
         self.accounts: dict[str, dict] = {}  # address -> getAccountInfo value (for Squads reads)
         self.rpc_calls: list[str] = []
-        self.refund_fails = self.attest_fails = False
+        self.refund_fails = self.attest_fails = self.payout_fails = False
+        self.payouts: list[tuple] = []
         self.fetch_errors: set[str] = set()
         self.n = 0
         monkeypatch.setattr(sol, "rpc", self._rpc)
@@ -59,6 +60,7 @@ class FakeChain:
         monkeypatch.setattr(sol, "get_parsed_tx", self._get_tx)
         monkeypatch.setattr(sol, "transfer_from", self._refund)
         monkeypatch.setattr(sol, "post_memo", self._memo)
+        monkeypatch.setattr(sol, "pay", self._pay)
 
     def deposit(self, sender: str, amount, memo: str | None = None) -> str:
         self.n += 1
@@ -96,6 +98,12 @@ class FakeChain:
             raise self.sol.SolanaError("refund tx failed")
         self.refunds.append((to, amount, memo))
         return f"refund{len(self.refunds)}"
+
+    def _pay(self, to, amount, memo=None, source=None):
+        if self.payout_fails:
+            raise self.sol.SolanaError("payout tx failed")
+        self.payouts.append((to, amount, memo))
+        return f"payout{len(self.payouts)}"
 
     def _memo(self, memo):
         if self.attest_fails:

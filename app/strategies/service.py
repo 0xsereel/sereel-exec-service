@@ -315,7 +315,9 @@ def ledger_cash(s: Session) -> Decimal:
     """What the strategies are entitled to hold as cash on the venue: credited margin plus realized P&L and funding,
     minus fees (fees are paid out of the dex balance, so they reduce what is actually there)."""
     rows = s.exec(select(Strategy).where(Strategy.status.in_(LIVE))).all()
-    return sum((r.margin_usd + r.realized_pnl_usd + r.funding_usd - r.fees_usd for r in rows), Decimal(0))
+    # a closing strategy whose margin was already released (margin 0) has nothing left on the venue
+    return sum((r.margin_usd + r.realized_pnl_usd + r.funding_usd - r.fees_usd for r in rows
+                if r.status != S_CLOSING or r.margin_usd > 0), Decimal(0))
 
 
 RECONCILE_TOLERANCE = Decimal("0.05")  # rounding and fee timing only; fees themselves are accounted for above

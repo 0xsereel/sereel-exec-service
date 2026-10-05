@@ -122,6 +122,9 @@ def health():
         out["active_strategies"] = s.exec(select(func.count()).select_from(Strategy).where(Strategy.status == S_ACTIVE)).one()
         out["active_schedules"] = s.exec(select(func.count()).select_from(Schedule).where(Schedule.status == "active")).one()
     out["unresolved_transfers"] = watcher.unresolved_transfers()  # refunds that failed or are unconfirmed: need a human
+    from .strategies import withdrawals as strategy_withdrawals
+
+    out["unresolved_withdrawals"] = strategy_withdrawals.unresolved()  # failed withdrawals that need an operator
     return out
 
 

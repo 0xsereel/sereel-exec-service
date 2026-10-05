@@ -36,3 +36,23 @@ def set_owner(strategy_id: str = typer.Argument(..., help="Strategy id"),
         console.print(f"  attestation (bound_by: operator): {sol.explorer_url(st.last_attestation_sig)}")
     else:
         console.print("[yellow]  the attestation could not be posted (check the attest key's SOL); the owner IS bound[/]")
+
+
+@strategies_app.command("retry-withdrawal")
+def retry_withdrawal(withdrawal_id: str = typer.Argument(..., help="Withdrawal id"),
+                     confirm_not_sent: bool = typer.Option(False, "--confirm-not-sent",
+                                                           help="You checked the chain: the failed payout was NOT sent")):
+    """Operator-only: resume a FAILED withdrawal from the step it failed at. A payout whose outcome is unknown is retried only
+    with --confirm-not-sent, after you have checked the funding wallet's transactions (memo: sereel <type> <id>)."""
+    from app.strategies import withdrawals
+
+    init_db()
+    try:
+        status = withdrawals.retry_withdrawal(withdrawal_id, confirm_not_sent)
+    except ServiceError as e:
+        _fail(f"{e.code}: {e.message}")
+    w = withdrawals._load(withdrawal_id)
+    console.print(f"withdrawal {withdrawal_id}: {w.status}" + (f" ({w.failure_reason})" if w.failure_reason else "") +
+                  (f"\n  payout: {w.solana_signature}" if w.solana_signature else ""))
+    if w.status == "failed":
+        raise typer.Exit(1)

@@ -194,6 +194,53 @@ the same strings that were signed; a JSON number in the body is rejected (`AUTHO
   transfer), the attestation signature and its explorer URL, and the full record.
 - **Numbers** in responses are JSON numbers rounded to 8 decimals.
 
+## Closing a strategy and returning funds (withdrawals)
+
+Two ways money leaves a strategy, both signed (see the authorization section) and both modelled as one **withdrawal**:
+
+- **`DELETE /strategies/{id}`** (`close_strategy`; the body carries `destination_wallet_address` and `authorization`):
+  closes the position and returns everything: margin + P&L - fees +/- funding.
+- **`POST /strategies/{id}/withdrawals`** (`return_excess`; `amount_usd` and `destination_wallet_address` as strings): returns
+  part of the margin and **keeps the hedge open**. Allowed only while the equity left stays at least **1.5x the required
+  margin**; otherwise `WITHDRAW_BELOW_MARGIN` with the maximum. The amount is reserved immediately, so two requests cannot
+  together exceed the cap. `type` may be sent, but only `return_excess` is accepted here.
+
+Both return a **StrategyWithdrawal** at once (`status: requested`) and a background step machine does the work; poll
+`GET /strategies/{id}/withdrawals/{wid}` (also listed at `GET /strategies/{id}/withdrawals`). A retried request (the same
+signed authorization and content) returns the same withdrawal instead of creating another.
+
+```
+requested -> position_closed -> released -> bridging -> completed          (failed from any of the first four)
+```
+
+| Step | What happens |
+|---|---|
+| `requested` | close: **check the book**, then close with reduce-only IOCs (retried); excess: nothing to close |
+| `position_closed` | USDC moves from the market's dex balance back to the main balance (master-signed on a `default` account) |
+| `released` | bridge to Solana: testnet `MirroredRoute` moves nothing; production `CctpHyperliquidRoute` is a stub |
+| `bridging` | the destination is paid on Solana from the funding wallet (on devnet, minting if the wallet is short); attested |
+
+For a close the final `amount_usd` is the ledger's finalized figure (the amount at `requested` is an estimate). The
+attestation covers the close fills, release, route and payout signature.
+
+**Liquidity.** Before sending anything, a close checks the book: it needs the strategy's whole size offered within the
+IOC's 0.5% slippage band of the mark. If not, the request fails with **`NO_LIQUIDITY`** (HTTP 409), says how much is
+offered and how much is needed, tells you to start the market maker, **sends nothing, and does not spend the signature**
+(the same signed request works once the book is back). The check runs again when the step executes, so a book that
+empties in between fails the withdrawal cleanly (the strategy goes back to `active`) instead of retrying into nothing.
+Partial closes keep the strategy `closing` with the reduced size; closing again finishes it.
+
+**Failure rules.**
+- Failed **before anything was traded**: the strategy returns to `active`.
+- `release` and `bridge` retry on transient errors (5 attempts, one per watcher tick), then fail with `needs_operator`.
+- The **Solana payout is never retried automatically**: a timeout can still land. It fails with `needs_operator`, `/health`
+  counts it in `unresolved_withdrawals`, and closing again is refused (it would pay twice). After you have checked the
+  funding wallet's transactions (memo `sereel <type> <id>`), run
+  **`sereel strategies retry-withdrawal <id> --confirm-not-sent`**. If the signature is already recorded (the money went out
+  and a later step failed), the retry only finishes the withdrawal and never sends again. A failed excess withdrawal
+  returns its reserved margin to the strategy; the operator retry reserves it again.
+- A crash mid-withdrawal resumes at the persisted step on the next watcher tick.
+
 ## Signed-message authorization and strategy ownership
 
 Strategy actions that move nothing on Solana (edit hedge settings, rebalance, close, return excess, change owner) are
@@ -348,6 +395,7 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `INTERNAL` | 500 | unexpected error (details are logged, never returned) |
 | `NOT_CONFIGURED` | 503 | a required setting is missing (e.g. STABLECOIN_MINT) |
 | `UNKNOWN_MARKET` | 404 | the market id is not in markets.yaml (or not found on the venue) |
+| `NO_LIQUIDITY` | 409 | the order book does not offer enough size within slippage of the mark to close the position; nothing was sent (start the market maker and retry) |
 | `ORDER_NOT_FILLED` | 400 | no fill after the IOC retries, or the venue rejected the order |
 | `VENUE_UNAVAILABLE` | 503 | the venue could not be reached or returned no price, so a live value cannot be computed |
 | `LEVERAGE_NOT_SET` | 503 | the venue did not confirm the configured leverage for the market, so no order was sent |

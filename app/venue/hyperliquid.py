@@ -151,6 +151,13 @@ class HyperliquidVenue(VenueAdapter):
                 out.liquidation_px = Decimal(p["liquidationPx"]) if p.get("liquidationPx") else None
         return out
 
+    def available_liquidity(self, market_id, is_buy, limit_px):
+        m = self.market(market_id)
+        bids, asks = self.info.post("/info", {"type": "l2Book", "coin": m.hl_coin})["levels"]
+        if is_buy:
+            return sum((Decimal(l["sz"]) for l in asks if Decimal(l["px"]) <= limit_px), Decimal(0))
+        return sum((Decimal(l["sz"]) for l in bids if Decimal(l["px"]) >= limit_px), Decimal(0))
+
     def funding_entries(self, market_id, since_ms):
         coin = self.market(market_id).hl_coin
         return [(int(e["time"]), Decimal(e["delta"]["usdc"])) for e in self.info.user_funding_history(self.master, since_ms)

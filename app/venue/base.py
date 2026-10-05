@@ -13,6 +13,7 @@ from .. import pyth
 from ..config import Market, settings
 from ..errors import ServiceError
 
+DEFAULT_SLIPPAGE = Decimal("0.005")  # IOC limit = mark +/- 0.5%; the liquidity pre-check uses the same band
 _locks: dict[str, threading.RLock] = {}
 _locks_guard = threading.Lock()
 
@@ -97,6 +98,11 @@ class VenueAdapter(ABC):
         """Move USDC from the market's dex balance back to the main balance (withdrawal path)."""
         raise NotImplementedError
 
+    def available_liquidity(self, market_id: str, is_buy: bool, limit_px: Decimal) -> Decimal:
+        """Size the book offers to an order on this side up to limit_px: asks at or below it when buying, bids at or
+        above it when selling. Infinity means the venue cannot say (no check is possible)."""
+        return Decimal("Infinity")
+
     def prepare_market(self, market_id: str) -> None:
         """Called inside the account lock before the first order of every set_position (e.g. set leverage)."""
 
@@ -131,7 +137,7 @@ class VenueAdapter(ABC):
         return mark
 
     def set_position(self, strategy_id: str, market_id: str, target_signed_size: Decimal,
-                     current_size: Decimal = Decimal(0), slippage: Decimal = Decimal("0.005")) -> FillReport:
+                     current_size: Decimal = Decimal(0), slippage: Decimal = DEFAULT_SLIPPAGE) -> FillReport:
         """Move this strategy's size from current_size to target by trading the delta on the shared account.
 
         Up to IOC_MAX_RETRIES IOC orders at mark +/- slippage. Every attempt is recorded; the final report carries

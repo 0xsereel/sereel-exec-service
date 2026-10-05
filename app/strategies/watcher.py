@@ -17,7 +17,7 @@ from sqlmodel import Session, select
 from .. import solana_client as sol
 from ..db import engine
 from ..models import (D_PENDING, S_PENDING, ChainTransfer, Strategy, StrategyDeposit, WatcherCursor, now)
-from . import service
+from . import service, withdrawals
 
 log = logging.getLogger("sereel.watcher")
 CURSOR = "funding"
@@ -177,7 +177,8 @@ def watch_once() -> dict:
         process_signature(sig, funding)  # an error stops the tick here and the cursor stays put: it is retried
         _set_cursor(sig)
         handled += 1
-    return {"transfers": handled, "activations": service.activate_ready(), "expired": service.expire_due()}
+    return {"transfers": handled, "activations": service.activate_ready(), "expired": service.expire_due(),
+            "withdrawals": withdrawals.advance_pending()}
 
 
 def register(sched) -> None:

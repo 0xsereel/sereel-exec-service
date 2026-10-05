@@ -26,6 +26,9 @@ class FakeInfo:
             {"position": {"coin": "xyz:GOLD", "szi": "-0.6", "entryPx": "2650.0", "unrealizedPnl": "5.5", "liquidationPx": "3900"}}]}
 
     def post(self, path, body):
+        if body["type"] == "l2Book":
+            return {"levels": [[{"px": "2650", "sz": "0.3"}, {"px": "2640", "sz": "0.2"}, {"px": "2600", "sz": "9"}],
+                               [{"px": "2655", "sz": "0.1"}, {"px": "2660", "sz": "0.4"}, {"px": "2700", "sz": "9"}]]}
         if body["type"] == "userAbstraction":
             return "default"
         if body["type"] == "activeAssetData":
@@ -277,3 +280,11 @@ def test_unconfirmed_leverage_blocks_trading_with_its_own_code():
 
 def test_maintenance_rate_is_one_over_twice_max_leverage():
     assert venue().maintenance_rate(M) == D("0.02")
+
+
+def test_available_liquidity_counts_only_the_levels_the_order_could_reach():
+    v = venue()
+    assert v.available_liquidity(M, True, D("2660")) == D("0.5")  # asks at 2655 and 2660; 2700 is beyond the limit
+    assert v.available_liquidity(M, True, D("2654")) == 0  # nothing offered that low
+    assert v.available_liquidity(M, False, D("2640")) == D("0.5")  # bids at 2650 and 2640; 2600 is beyond the limit
+    assert v.available_liquidity(M, False, D("2651")) == 0

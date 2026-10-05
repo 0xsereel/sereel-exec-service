@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, BackgroundTasks, Header, Request
 
 from .. import auth as authmod
 from .. import solana_client as sol
 from ..config import settings
 from ..deps import auth
 from ..errors import ServiceError
-from . import service
+from . import service, withdrawals
 
 router = APIRouter(prefix="/strategies", dependencies=auth)
 
@@ -99,3 +99,38 @@ def value(sid: str, as_of: str | None = None, org: str = ORG):
 @router.get("/{sid}/history")
 def history(sid: str, org: str = ORG):
     return service.strategy_history(sid, org)
+
+
+@router.delete("/{sid}")
+async def close(sid: str, request: Request, background: BackgroundTasks, org: str = ORG):
+    """Close the strategy (signed: `close_strategy`). Returns a StrategyWithdrawal of type `close` at once; the position is
+    closed, the funds released, bridged and paid to `destination_wallet_address` in the background. Poll
+    GET /strategies/{id}/withdrawals/{wid}. Fails with NO_LIQUIDITY, sending nothing, if the book cannot take the close."""
+    _, authorization, params = await signed_body(request, ("destination_wallet_address",))
+    authmod.validate_params(params)
+    w = withdrawals.request_close(sid, params, authorization, org)
+    background.add_task(withdrawals.advance_withdrawal, w.id)
+    return withdrawals.withdrawal_out(w)
+
+
+@router.post("/{sid}/withdrawals")
+async def withdraw(sid: str, request: Request, background: BackgroundTasks, org: str = ORG):
+    """Return excess margin to a wallet while keeping the hedge open (signed: `return_excess`). `type` may be sent but only
+    `return_excess` is accepted here; closing goes through DELETE /strategies/{id}."""
+    body, authorization, params = await signed_body(request, ("amount_usd", "destination_wallet_address"))
+    if body.get("type", "return_excess") != "return_excess":
+        raise ServiceError("BAD_REQUEST", "type must be return_excess; use DELETE /strategies/{id} to close", 400)
+    authmod.validate_params(params)
+    w = withdrawals.request_excess(sid, params, authorization, org)
+    background.add_task(withdrawals.advance_withdrawal, w.id)
+    return withdrawals.withdrawal_out(w)
+
+
+@router.get("/{sid}/withdrawals")
+def list_withdrawals(sid: str, org: str = ORG):
+    return [withdrawals.withdrawal_out(w) for w in withdrawals.list_withdrawals(sid, org)]
+
+
+@router.get("/{sid}/withdrawals/{wid}")
+def get_withdrawal(sid: str, wid: str, org: str = ORG):
+    return withdrawals.withdrawal_out(withdrawals.get_withdrawal(sid, wid, org))

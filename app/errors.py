@@ -25,6 +25,7 @@ CODES: dict[str, tuple[int, str]] = {
     "NOT_CONFIGURED": (503, "a required setting is missing (e.g. STABLECOIN_MINT)"),
     # --- trading / venue ---
     "UNKNOWN_MARKET": (404, "the market id is not in markets.yaml (or not found on the venue)"),
+    "NO_LIQUIDITY": (409, "the order book does not offer enough size within slippage of the mark to close the position; nothing was sent (start the market maker and retry)"),
     "ORDER_NOT_FILLED": (400, "no fill after the IOC retries, or the venue rejected the order"),
     "VENUE_UNAVAILABLE": (503, "the venue could not be reached or returned no price, so a live value cannot be computed"),
     "LEVERAGE_NOT_SET": (503, "the venue did not confirm the configured leverage for the market, so no order was sent"),
