@@ -51,14 +51,25 @@ def test_auth_required_and_fails_closed(monkeypatch):
 def test_error_bodies_use_v4_error_field_plus_code(monkeypatch):
     monkeypatch.setattr(settings, "api_key", "test-key")
     c = client()
-    assert c.get("/secret").json() == {"error": "missing or invalid X-Sereel-Key", "code": "UNAUTHORIZED"}
-    assert c.get("/boom", headers=H).json() == {"error": "mark off", "code": "PRICE_DEVIATION"}
+    assert c.get("/secret").json() == {"error": "missing or invalid X-Sereel-Key", "code": "UNAUTHORIZED",
+                                         "message": "missing or invalid X-Sereel-Key"}
+    assert c.get("/boom", headers=H).json() == {"error": "mark off", "code": "PRICE_DEVIATION", "message": "mark off"}
     r = c.post("/echo", headers=H, json={"n": "x"})
     assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST" and r.json()["error"].startswith("n:")
     r = c.get("/nope", headers=H)
     assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND" and "error" in r.json()
     r = c.get("/crash", headers=H)
-    assert r.status_code == 500 and r.json() == {"error": "unexpected error", "code": "INTERNAL"}  # no internals leaked
+    assert r.status_code == 500 and r.json() == {"error": "unexpected error", "code": "INTERNAL", "message": "unexpected error"}  # no internals leaked
+
+
+def test_error_body_parses_as_both_v4_and_original_spec_shapes(monkeypatch):
+    monkeypatch.setattr(settings, "api_key", "test-key")
+    c = client()
+    for r in (c.get("/secret"), c.get("/boom", headers=H), c.post("/echo", headers=H, json={"n": "x"}), c.get("/nope", headers=H)):
+        body = r.json()
+        assert isinstance(body["error"], str) and body["error"]  # v4: { "error": string }
+        assert isinstance(body["code"], str) and body["message"] == body["error"]  # original: { code, message }
+        assert set(body) == {"error", "code", "message"}
 
 
 def test_health_is_open_and_reports_everything():

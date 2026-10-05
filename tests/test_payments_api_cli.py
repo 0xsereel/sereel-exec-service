@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 from app import main
 from app import solana_client as sol
 from app.config import settings
+from app.payments import service
 from cli import payouts
 from cli.sereel_cli import app as cli_app
 
@@ -145,9 +146,22 @@ def test_new_interactive_follows_the_spec_prompt_order(root):
 def test_run_registers_once_then_list_pause_resume_stop_by_name(root):
     runner.invoke(cli_app, ["payouts", "new", "--name", "rev", "--fund-id", "F", "--to", WALLET, "--interval", "60", "--mode",
                             "fixed", "--amount", "10", "--yes", "--no-start"])
-    assert "started" in runner.invoke(cli_app, ["payouts", "run", "rev"]).output
-    again = runner.invoke(cli_app, ["payouts", "run", "rev"])
-    assert again.exit_code == 0 and "already registered" in again.output  # restart without prompts, no duplicate
+    first = runner.invoke(cli_app, ["payouts", "run", "rev"])
+    assert first.exit_code == 0 and "started" in first.output and "schedule id:" in first.output  # prints the new id
+    sid = service.get_schedule("rev").id
+    assert sid in first.output.replace("\n", "")
+    again = runner.invoke(cli_app, ["payouts", "run", "rev"])  # already active: refuse, create nothing
+    said = " ".join(again.output.split())  # rich wraps long lines
+    assert again.exit_code == 1 and "already has an active schedule" in said and sid in said and "Nothing was created" in said
+    assert len(service.list_schedules()) == 1
+    runner.invoke(cli_app, ["payouts", "pause", "rev"])
+    paused = runner.invoke(cli_app, ["payouts", "run", "rev"])
+    assert paused.exit_code == 1 and "already has a paused schedule" in " ".join(paused.output.split())
+    assert "resume" in paused.output and len(service.list_schedules()) == 1
+    runner.invoke(cli_app, ["payouts", "stop", "rev"])
+    restarted = runner.invoke(cli_app, ["payouts", "run", "rev"])  # a stopped profile may be started again: a NEW schedule
+    assert restarted.exit_code == 0 and "started" in restarted.output and len(service.list_schedules()) == 2
+    assert service.get_schedule("rev").id != sid and service.get_schedule("rev").id in restarted.output.replace("\n", "")
     assert "rev" in runner.invoke(cli_app, ["payouts", "list"]).output
     assert "paused" in runner.invoke(cli_app, ["payouts", "pause", "rev"]).output
     assert "resumed" in runner.invoke(cli_app, ["payouts", "resume", "rev"]).output

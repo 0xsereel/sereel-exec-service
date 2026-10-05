@@ -73,3 +73,20 @@ The master was funded by an internal spot `send` from another account plus a cla
 deposit** from Arbitrum, which is the likely reason (unconfirmed: Hyperliquid documents no such rule). To be
 re-verified with a bridge-funded account. Not blocking: the production return path is `CctpHyperliquidRoute`, which
 remains a stub (Hyperliquid withdraw to Arbitrum, CCTP to Solana); on testnet `MirroredRoute` skips the bridge.
+
+## Database and migrations
+
+The schema is managed by **Alembic** (`migrations/`, baseline revision `baseline`). Nothing else creates or alters
+tables. `DATABASE_URL` defaults to SQLite (`sqlite:///./service.db`, resolved against the project root) and is
+Postgres-ready (`pip install -e ".[postgres]"`, `DATABASE_URL=postgresql+psycopg://...`).
+
+- **`sereel init` runs `alembic upgrade head`**, and so does `sereel serve` on startup, so a database is always at
+  the latest schema before anything uses it. You can also run it by hand: `alembic upgrade head`, `alembic current`.
+- **Every schema change ships as a migration.** After changing `app/models.py`:
+  `alembic revision --autogenerate -m "what changed"`, read the generated file (autogenerate misses some changes
+  such as renames), and commit it with the model change. A test fails whenever the models and migrations have drifted
+  apart, so a model change without a migration cannot pass CI.
+- **SQLite** cannot alter tables in place, so migrations run in batch mode (the table is recreated); this is automatic.
+- A database created before Alembic was added (tables present, no `alembic_version`) is stamped at the baseline and
+  upgraded in place, keeping its rows.
+- Roll back with `alembic downgrade -1` (or `base`). Back up the database first.

@@ -45,6 +45,11 @@ def init(
     except RuntimeError as e:
         _fail(str(e))
 
+    from app.db import init_db
+
+    init_db()  # alembic upgrade head
+    console.print("database: migrated to head (alembic upgrade head)")
+
     status = setup.ensure_keys(force)
     for name, s in status.items():
         console.print(f"keys/{name}: {s}")

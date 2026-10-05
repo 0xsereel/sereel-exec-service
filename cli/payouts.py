@@ -71,19 +71,21 @@ def _pick_feed() -> str:
 
 
 def _create(profile: dict) -> None:
-    """Start a profile as a live schedule (idempotent by name)."""
+    """Start a profile as a new live schedule. Refuses if that profile already has an active (or paused) one."""
     try:
         existing = next((s for s in service.list_schedules() if s.name == profile["name"] and s.status in ("active", "paused")), None)
         if existing:
-            console.print(f"already registered: '{profile['name']}' is {existing.status} (id {existing.id}); nothing to do")
-            return
-        body = service.ScheduleIn(**{k: v for k, v in profile.items() if k != "fund_id" or v},
-                                  start_immediately=False)
+            hint = "resume it with `sereel payouts resume`" if existing.status == "paused" else "stop it first with `sereel payouts stop`"
+            article = "an" if existing.status == "active" else "a"
+            _fail(f"'{profile['name']}' already has {article} {existing.status} schedule (id {existing.id}); {hint} "
+                  "if you want to start a new one. Nothing was created.")
+        body = service.ScheduleIn(**{k: v for k, v in profile.items() if k != "fund_id" or v}, start_immediately=False)
         sc = service.create_schedule(body)
     except ServiceError as e:
         _fail(f"{e.code}: {e.message}")
-    console.print(f"[green]started[/] '{sc.name}' every {sc.interval_seconds}s, first payment at {iso(sc.next_run)}. "
-                  "It is paid by `sereel serve` (or `sereel payouts run <profile> --foreground`).")
+    console.print(f"[green]started[/] '{sc.name}' every {sc.interval_seconds}s, first payment at {iso(sc.next_run)}\n"
+                  f"  schedule id: {sc.id}\n"
+                  "  It is paid by `sereel serve` (or `sereel payouts run <profile> --foreground`).")
 
 
 @payouts_app.command("new")

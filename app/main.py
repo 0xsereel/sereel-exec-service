@@ -49,8 +49,9 @@ app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in settings.co
 
 
 def err(status: int, code: str, message: str) -> JSONResponse:
-    """v4 error body: {"error": <human message>}; `code` is added for machine use."""
-    return JSONResponse(status_code=status, content={"error": message, "code": code})
+    """Error body that satisfies both parser shapes: v4's {"error": <message>} and the original spec's
+    {"code", "message"}. `error` and `message` carry the same text; `code` is the machine-readable code."""
+    return JSONResponse(status_code=status, content={"error": message, "code": code, "message": message})
 
 
 @app.exception_handler(ServiceError)
