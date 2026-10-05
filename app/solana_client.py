@@ -10,7 +10,7 @@ from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.message import Message
 from solders.pubkey import Pubkey
-from solders.system_program import CreateAccountParams, create_account
+from solders.system_program import CreateAccountParams, TransferParams, create_account, transfer
 from solders.transaction import Transaction
 from spl.memo.instructions import create_memo
 from spl.memo.models import MemoParams
@@ -162,6 +162,10 @@ def airdrop(pubkey: Pubkey, sol: float = 2) -> str | None:
         return rpc("requestAirdrop", [str(pubkey), int(sol * 1e9)])
     except Exception:
         return None
+
+
+def transfer_sol(source: Keypair, to: Pubkey, sol: Decimal) -> str:
+    return send([transfer(TransferParams(from_pubkey=source.pubkey(), to_pubkey=to, lamports=int(Decimal(sol) * 10**9)))], [source])
 
 
 def sol_balance(pubkey: Pubkey) -> Decimal:

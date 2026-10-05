@@ -46,17 +46,21 @@ have a counterparty on the thin testnet book. It refuses to start unless `HL_API
 
 The service trades only with the API wallet. Moving margin and withdrawing are user-signed actions that need the master.
 
-**Evidence that the trading key cannot withdraw (live, Hyperliquid testnet).** A `withdraw3` for $10 to the master's own
+**Why an API wallet cannot withdraw:** `withdraw3` is a user-signed action that debits **only the signer's own
+account**. It has no "on behalf of" field (unlike orders, which are signed by an agent for a named account), so an
+API-wallet signature can only ever ask to withdraw from the API wallet's own, empty, account. It cannot move master
+funds.
+
+**Illustration (live, Hyperliquid testnet).** A `withdraw3` for $10 to the master's own
 address, signed with `HL_API_WALLET_KEY` (an approved agent of the master), was rejected:
 
 ```
 {'status': 'err', 'response': 'Must deposit before performing actions. User: 0xdb6e7d6594664a188e83e43816246b09e5a9d853'}
 ```
 
-`0xdb6e…` is the **API wallet's own address**. Withdrawals are user-signed, so Hyperliquid attributes the request to
-the signer; an agent cannot express "withdraw from the master", only "withdraw from myself", and it has no balance.
-The master's balance and ledger were unchanged. (This is a rejection by account, not a literal "agents cannot
-withdraw" message.)
+`0xdb6e…` is the **API wallet's own address**: Hyperliquid attributed the request to the signer and found no account
+with a balance. The master's balance and ledger were unchanged. (The rejection is by account, not a literal
+"agents cannot withdraw" message; the guarantee comes from the action's design, described above.)
 
 ## Withdrawals
 
