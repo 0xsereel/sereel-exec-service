@@ -25,7 +25,9 @@ class FakeInfo:
             {"position": {"coin": "xyz:GOLD", "szi": "-0.6", "entryPx": "2650.0", "unrealizedPnl": "5.5", "liquidationPx": "3900"}}]}
 
     def post(self, path, body):
-        return {"universe": [{"name": "xyz:GOLD"}]}, [{"markPx": "2651.5"}]
+        if body["type"] == "userAbstraction":
+            return "default"
+        return {"universe": [{"name": "xyz:GOLD"}]}, [{"markPx": "2651.5", "oraclePx": "2640.0"}]
 
     def spot_user_state(self, addr):
         return {"balances": [{"coin": "USDC", "total": self.spot, "hold": "0.0"}]}
@@ -61,6 +63,7 @@ def venue(status=None, master=True):
     v = HyperliquidVenue.__new__(HyperliquidVenue)
     v.markets, v.master, v.account_key = load_markets(), "0xme", "0xme"
     v.info, v._sz_dec, v.asset_ids = FakeInfo(), {M: 4}, {M: 750003}
+    v.mode = "default"
     v.exchange = FakeExchange(status or {"filled": {"avgPx": "2650", "oid": 7, "totalSz": "0.1"}})
     v._master_exchange = FakeExchange({}) if master else None
     return v
@@ -151,3 +154,38 @@ def test_release_margin_moves_dex_back_to_main():
     v = venue()
     v.release_margin(M, D(25))
     assert v._master_exchange.sent == [("0xme", "xyz", "", "USDC:0xabc", 25.0)]
+
+
+def test_oracle_price():
+    assert venue().oracle_price(M) == D("2640.0")
+
+
+@pytest.mark.parametrize("mode", ["unifiedAccount", "portfolioMargin"])
+def test_unified_accounts_skip_dex_transfers(mode):
+    v = venue()
+    v.mode = mode
+    v.ensure_margin(M, D(160))  # spot USDC 300 covers it; collateral is shared, so nothing moves
+    v.release_margin(M, D(25))
+    assert v._master_exchange.sent == []
+
+
+def test_unified_account_still_checks_it_holds_enough():
+    v = venue()
+    v.mode = "unifiedAccount"
+    with pytest.raises(ServiceError) as e:
+        v.ensure_margin(M, D(1000))
+    assert e.value.code == "INSUFFICIENT_MARGIN"
+
+
+def test_account_mode_detection():
+    from app.venue.hyperliquid import account_mode, is_unified
+
+    class I:
+        def __init__(self, r): self.r = r
+        def post(self, path, body):
+            assert body == {"type": "userAbstraction", "user": "0xa"}
+            return self.r
+
+    assert account_mode(I("unifiedAccount"), "0xa") == "unifiedAccount"
+    assert is_unified("unifiedAccount") and is_unified("portfolioMargin")
+    assert not is_unified("default") and not is_unified("dexAbstraction") and not is_unified("disabled")

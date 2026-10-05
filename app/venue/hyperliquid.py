@@ -4,6 +4,7 @@ The service trades with an API (agent) wallet, which can place and cancel orders
 between the main perp balance and a builder dex is a user-signed action, so it needs the master key
 (HL_MASTER_KEY, dev only; in production that signature comes from the manager's passkey flow).
 """
+import logging
 import time
 from decimal import Decimal
 
@@ -14,6 +15,21 @@ from hyperliquid.info import Info
 from ..config import Market, settings
 from ..errors import ServiceError
 from .base import PositionState, VenueAdapter
+
+log = logging.getLogger("sereel.venue")
+
+UNIFIED_MODES = ("unifiedAccount", "portfolioMargin")
+
+
+def account_mode(info: Info, address: str) -> str:
+    """Hyperliquid account abstraction: default | unifiedAccount | portfolioMargin | dexAbstraction | disabled."""
+    r = info.post("/info", {"type": "userAbstraction", "user": address})
+    return r if isinstance(r, str) else str(r)
+
+
+def is_unified(mode: str) -> bool:
+    """Unified/portfolio accounts share collateral across spot and every perp dex: no dex transfers exist or are needed."""
+    return mode in UNIFIED_MODES
 
 
 class HyperliquidVenue(VenueAdapter):
@@ -35,6 +51,11 @@ class HyperliquidVenue(VenueAdapter):
         self.asset_ids: dict[str, int] = {}
         self._sz_dec: dict[str, int] = {}
         self.resolve_markets()
+        self.mode = account_mode(self.info, self.master)
+        log.info("master account abstraction: %s", self.mode)
+        if is_unified(self.mode):
+            log.warning("master is %s, expected 'default': dex margin transfers will be skipped and per-dex "
+                        "reconciliation is not meaningful", self.mode)
 
     # -- market resolution ----------------------------------------------------
     def resolve_markets(self) -> None:
@@ -66,6 +87,11 @@ class HyperliquidVenue(VenueAdapter):
         return self._sz_dec[market_id]
 
     # -- reads ----------------------------------------------------------------
+    def oracle_price(self, market_id) -> Decimal:
+        m = self.market(market_id)
+        meta, ctxs = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": m.hl_dex})
+        return next(Decimal(c["oraclePx"]) for u, c in zip(meta["universe"], ctxs) if u["name"] == m.hl_coin)
+
     def mark_price(self, market_id):
         m = self.market(market_id)
         meta, ctxs = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": m.hl_dex})
@@ -119,6 +145,11 @@ class HyperliquidVenue(VenueAdapter):
         m = self.market(market_id)
         if not m.hl_dex:
             return
+        if is_unified(self.mode):
+            spot = self._spot_usdc()
+            if spot < Decimal(usd_amount):
+                raise ServiceError("INSUFFICIENT_MARGIN", f"unified account holds {spot} USDC, need {usd_amount}")
+            return  # collateral is shared; nothing to move
         have = Decimal(self.info.user_state(self.master, dex=m.hl_dex)["marginSummary"]["accountValue"])
         need = Decimal(usd_amount) - have
         if need <= 0:
@@ -136,7 +167,7 @@ class HyperliquidVenue(VenueAdapter):
 
     def release_margin(self, market_id, usd_amount):
         m = self.market(market_id)
-        if m.hl_dex:
+        if m.hl_dex and not is_unified(self.mode):
             self._transfer(m.hl_dex, "", Decimal(usd_amount))
 
     # -- orders ---------------------------------------------------------------
