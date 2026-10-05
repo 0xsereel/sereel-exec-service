@@ -90,6 +90,10 @@ class VenueAdapter(ABC):
     @abstractmethod
     def _fees_for(self, market_id: str, oids: list[str], fallback_notional: Decimal) -> Decimal: ...
 
+    def release_margin(self, market_id: str, usd_amount: Decimal) -> None:
+        """Move USDC from the market's dex balance back to the main balance (withdrawal path)."""
+        raise NotImplementedError
+
     def funding_since(self, market_id: str, since_ms: int) -> Decimal:
         return Decimal(0)
 

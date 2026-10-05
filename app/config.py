@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     rebalance_band_pct: Decimal = Decimal(5)
     max_price_deviation_bps: Decimal = Decimal(200)
     ioc_max_retries: int = 3
+    mm_min_size: Decimal = Decimal("0.02")  # market maker per-level order size bounds (coin units)
+    mm_max_size: Decimal = Decimal("0.05")
     intent_ttl_seconds: int = 3600
     intent_ttl_multisig_seconds: int = 7 * 24 * 3600
 
