@@ -25,7 +25,7 @@ class PythPrice:
 
 
 def _headers() -> dict:
-    return {"x-api-key": settings.pyth_api_key} if settings.pyth_api_key else {}
+    return {"Authorization": f"Bearer {settings.pyth_api_key}"} if settings.pyth_api_key else {}
 
 
 def get_price(feed_id: str, max_staleness_s: int | None = 30) -> PythPrice:
