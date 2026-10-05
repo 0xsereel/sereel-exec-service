@@ -3,7 +3,7 @@ return excess, change owner). Cantina v4 contract:
 
     message   = sereel-strategy-v1|<network>|<wallet_pubkey>|<action>|<strategy_id>|<params_hash>|<nonce>|<timestamp>
     params_hash = lowercase hex sha256 of the canonical JSON of the action's params (keys sorted, no whitespace,
-                  amounts as decimal strings, integers for whole-number fields; see FIELD_TYPES)
+                  every value a string: decimal strings for amounts, digit strings for whole numbers; see FIELD_TYPES)
     signature = raw ed25519 over the UTF-8 message, base58
 
 The server rebuilds the message itself and never trusts the client's string. A strategy is managed by its bound owner:
@@ -38,17 +38,16 @@ NONCE_TTL_S = 120  # anything older than the 60s age limit is already rejected; 
 
 
 # ---- canonical params ------------------------------------------------------------------------------------------------
-# The exact format clients must produce (see the README):
-#   * UTF-8 JSON, object keys sorted (by code point) at every level, no whitespace anywhere
-#   * every amount, price or quantity is a DECIMAL STRING ("520.5"); JSON numbers are not allowed for them
-#   * whole-number fields (basis points) are JSON integers; no floats anywhere
+# The exact format clients must produce (see the README): a flat JSON object whose values are ALL strings.
+#   * UTF-8 JSON, keys sorted (by code point), no whitespace anywhere
+#   * no JSON numbers anywhere: amounts are decimal strings ("520.5") and whole numbers are digit strings ("6000")
 #   * strings are escaped as JSON.stringify does (", \, control characters); non-ASCII is left as is
-MAX_SAFE_INT = 2 ** 53 - 1
 DECIMAL_RE = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$")  # no sign, no exponent, no leading zeros, <= 18 decimals
+WHOLE_RE = re.compile(r"^(0|[1-9][0-9]{0,14})$")  # a non-negative whole number as digits
 
-# what each signed field must be: "decimal" (a decimal string), "int" (a JSON integer), "str" (a string)
+# what each signed field must be: "decimal" (a decimal string), "whole" (a whole-number string), "str" (any string)
 FIELD_TYPES = {
-    "hedge_ratio_bps": "int",
+    "hedge_ratio_bps": "whole",
     "target_exposure_units": "decimal",
     "amount_usd": "decimal",
     "destination_wallet_address": "str",
@@ -58,43 +57,34 @@ FIELD_TYPES = {
 
 
 def canonical_json(o) -> str:
-    if o is None:
-        return "null"
-    if o is True:
-        return "true"
-    if o is False:
-        return "false"
-    if isinstance(o, int):
-        if abs(o) > MAX_SAFE_INT:
-            raise ValueError("integer outside the safe range")
-        return str(o)
+    """Canonical text of signed params. Only strings (and the objects/arrays holding them) can be canonicalised: a
+    number, boolean or null is an error, because two clients could print the same number differently."""
     if isinstance(o, str):
         return json.dumps(o, ensure_ascii=False)
     if isinstance(o, (list, tuple)):
         return "[" + ",".join(canonical_json(v) for v in o) + "]"
     if isinstance(o, dict):
         return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + canonical_json(o[k]) for k in sorted(o)) + "}"
-    raise ValueError(f"{type(o).__name__} is not allowed in signed params (amounts and prices must be decimal strings)")
+    raise ValueError(f"{'null' if o is None else type(o).__name__} is not allowed in signed params: every value is a string")
 
 
 def validate_params(params: dict) -> None:
-    """Reject anything that is not in the canonical params format. A JSON number where a decimal string belongs is
-    AUTHORIZATION_INVALID: two clients could otherwise serialise the same number differently and sign different bytes."""
+    """Reject anything that is not in the canonical params format. A JSON number anywhere (including a whole number such
+    as 6000) is AUTHORIZATION_INVALID: the client must send the string "6000"."""
     for key, value in params.items():
         kind = FIELD_TYPES.get(key)
         if kind is None:
             raise _invalid(f"params.{key} is not a signable field")
-        if isinstance(value, float) or (kind == "decimal" and isinstance(value, int) and not isinstance(value, bool)):
-            raise _invalid(f'params.{key} must be a decimal string such as "520.5", not a JSON number')
-        if kind == "decimal":
-            if not isinstance(value, str) or not DECIMAL_RE.match(value):
-                raise _invalid(f'params.{key} must be a decimal string such as "520.5" '
-                               "(digits with an optional fractional part: no sign, exponent or leading zeros)")
-        elif kind == "int":
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > MAX_SAFE_INT:
-                raise _invalid(f"params.{key} must be a non-negative JSON integer")
-        elif not isinstance(value, str):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            example = '"6000"' if kind == "whole" else '"520.5"'
+            raise _invalid(f"params.{key} must be a string such as {example}, not a JSON number")
+        if not isinstance(value, str):
             raise _invalid(f"params.{key} must be a string")
+        if kind == "decimal" and not DECIMAL_RE.match(value):
+            raise _invalid(f'params.{key} must be a decimal string such as "520.5" '
+                           "(digits with an optional fractional part: no sign, exponent or leading zeros)")
+        if kind == "whole" and not WHOLE_RE.match(value):
+            raise _invalid(f'params.{key} must be a whole-number string such as "6000" (digits only: no sign, fraction or leading zeros)')
 
 
 def params_hash(params: dict) -> str:

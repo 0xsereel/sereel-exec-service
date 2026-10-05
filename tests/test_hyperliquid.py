@@ -42,8 +42,8 @@ class FakeInfo:
         return [{"oid": 1, "fee": "0.4"}, {"oid": 1, "fee": "0.1"}, {"oid": 2, "fee": "9"}]
 
     def user_funding_history(self, addr, since):
-        return [{"delta": {"coin": "xyz:GOLD", "usdc": "-0.25"}}, {"delta": {"coin": "xyz:GOLD", "usdc": "0.05"}},
-                {"delta": {"coin": "BTC", "usdc": "99"}}]
+        return [{"time": 1000, "delta": {"coin": "xyz:GOLD", "usdc": "-0.25"}}, {"time": 2000, "delta": {"coin": "xyz:GOLD", "usdc": "0.05"}},
+                {"time": 3000, "delta": {"coin": "BTC", "usdc": "99"}}]
 
 
 class FakeExchange:
@@ -104,8 +104,11 @@ def test_position_and_mark_parsing():
            (D("-0.6"), D(2650), D("5.5"), D(3900), D("2651.5"), D(100))
 
 
-def test_funding_sums_only_this_coin():
-    assert venue().funding_since(M, 0) == D("-0.20")
+def test_funding_sums_only_this_coin_and_entries_carry_their_time():
+    v = venue()
+    assert v.funding_since(M, 0) == D("-0.20")
+    assert v.funding_entries(M, 0) == [(1000, D("-0.25")), (2000, D("0.05"))]
+    assert v.funding_entries(M, 1000) == [(2000, D("0.05"))]  # strictly after the cursor: nothing is counted twice
 
 
 def test_fees_use_actual_fills_for_the_orders_only():

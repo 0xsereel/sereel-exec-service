@@ -151,10 +151,10 @@ class HyperliquidVenue(VenueAdapter):
                 out.liquidation_px = Decimal(p["liquidationPx"]) if p.get("liquidationPx") else None
         return out
 
-    def funding_since(self, market_id, since_ms):
+    def funding_entries(self, market_id, since_ms):
         coin = self.market(market_id).hl_coin
-        return sum((Decimal(e["delta"]["usdc"]) for e in self.info.user_funding_history(self.master, since_ms)
-                    if e["delta"].get("coin") == coin), Decimal(0))
+        return [(int(e["time"]), Decimal(e["delta"]["usdc"])) for e in self.info.user_funding_history(self.master, since_ms)
+                if e["delta"].get("coin") == coin and int(e["time"]) > since_ms]
 
     # -- margin ---------------------------------------------------------------
     def _usdc_token(self) -> str:

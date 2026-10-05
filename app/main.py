@@ -34,6 +34,9 @@ async def lifespan(app: FastAPI):
     from .venue.hyperliquid import get_venue
 
     state.venue = get_venue(state.markets)
+    from .strategies import service as strategies_service
+
+    strategies_service.recover_interrupted()
     from .strategies import watcher
 
     try:

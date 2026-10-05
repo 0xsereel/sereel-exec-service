@@ -26,6 +26,7 @@ CODES: dict[str, tuple[int, str]] = {
     # --- trading / venue ---
     "UNKNOWN_MARKET": (404, "the market id is not in markets.yaml (or not found on the venue)"),
     "ORDER_NOT_FILLED": (400, "no fill after the IOC retries, or the venue rejected the order"),
+    "VENUE_UNAVAILABLE": (503, "the venue could not be reached or returned no price, so a live value cannot be computed"),
     "LEVERAGE_NOT_SET": (503, "the venue did not confirm the configured leverage for the market, so no order was sent"),
     "VENUE_NOT_CONFIGURED": (503, "Hyperliquid credentials are not set"),
     "PRICE_SOURCE_AUTH": (502, "Pyth Hermes rejected the credentials (PYTH_API_KEY)"),

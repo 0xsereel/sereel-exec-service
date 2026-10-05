@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Header, Request
 
+from .. import auth as authmod
 from .. import solana_client as sol
 from ..config import settings
 from ..deps import auth
@@ -71,3 +72,30 @@ async def change_owner(sid: str, request: Request, org: str = ORG):
     one of owner_pubkey / owner_multisig being set)."""
     _, authorization, params = await signed_body(request, ("owner_pubkey", "owner_multisig"))
     return service.strategy_out(service.change_owner(sid, params, authorization, org))
+
+
+@router.patch("/{sid}")
+async def edit(sid: str, request: Request, org: str = ORG):
+    """Change the hedge ratio and/or exposure (moves the target only; rebalance trades). Signed: `edit_hedge_settings`.
+    Both fields are strings and are exactly what is signed; a JSON number is rejected before anything is stored."""
+    _, authorization, params = await signed_body(request, ("hedge_ratio_bps", "target_exposure_units"))
+    authmod.validate_params(params)
+    return service.strategy_out(service.edit_settings(sid, params, authorization, org))
+
+
+@router.post("/{sid}/rebalance")
+async def rebalance(sid: str, request: Request, force: bool = False, org: str = ORG):
+    """Move the hedge to its target if the gap exceeds the rebalance band (`?force=true` trades regardless). Signed."""
+    _, authorization, _ = await signed_body(request, ())
+    return service.strategy_out(service.rebalance(sid, authorization, force, org))
+
+
+@router.get("/{sid}/value")
+def value(sid: str, as_of: str | None = None, org: str = ORG):
+    """Live value, or the P&L snapshot at or just before `as_of` (ISO 8601 or Unix ms)."""
+    return service.strategy_value(sid, org, as_of)
+
+
+@router.get("/{sid}/history")
+def history(sid: str, org: str = ORG):
+    return service.strategy_history(sid, org)

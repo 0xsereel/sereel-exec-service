@@ -190,4 +190,12 @@ def register(sched) -> None:
         except Exception:
             log.exception("watcher tick failed (will retry)")
 
+    def snapshots():
+        try:
+            n = service.snapshot_all()
+            log.debug("snapshots: %s", n)
+        except Exception:
+            log.exception("snapshot tick failed (will retry)")
+
     sched.add_job(tick, "interval", seconds=5, id="deposit-watcher", max_instances=1, coalesce=True, misfire_grace_time=5)
+    sched.add_job(snapshots, "interval", seconds=60, id="pnl-snapshots", max_instances=1, coalesce=True, misfire_grace_time=30)

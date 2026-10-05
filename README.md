@@ -158,6 +158,42 @@ is never rosier than the venue's.
 it to `false` in production: the API then refuses to start unless the database is already at the latest revision, and
 you run `alembic upgrade head` yourself.
 
+## Editing, rebalancing, value and history
+
+All the signed calls below take the string-only params described in the authorization section, and the body fields must be
+the same strings that were signed; a JSON number in the body is rejected (`AUTHORIZATION_INVALID`) before anything is stored.
+
+- **`PATCH /strategies/{id}`** (`edit_hedge_settings`): changes `hedge_ratio_bps` and/or `target_exposure_units` (both
+  strings). It moves the **target only**; no order is sent. It recomputes `required_margin_usd` and returns the strategy
+  with `hedge_gap_units` / `hedge_gap_bps` (target short minus current short; positive means under-hedged). Active
+  strategies only.
+- **`POST /strategies/{id}/rebalance`** (`rebalance`, params `{}`): trades the hedge to its target if the gap is beyond the
+  strategy's `rebalance_band_bps` (a gap exactly equal to the band does not trade); **`?force=true`** trades regardless.
+  Shrinking is **reduce-only**; growing is not, and needs the strategy's own capital (margin + realized P&L + funding -
+  fees) to cover the new size at its leverage, else `INSUFFICIENT_MARGIN` ("add margin with a top-up"). A within-band call
+  trades and attests nothing (the signed request is still recorded). A partial fill leaves the remaining gap visible;
+  nothing filled is `ORDER_NOT_FILLED` and leaves the strategy untouched. It is held (409) while the venue position and
+  the ledger disagree. A crash mid-rebalance is recovered at startup.
+- **The fill ledger:** growing blends the entry price; shrinking realizes P&L on the part closed at the unchanged entry
+  (a short gains when the price fell); flipping through zero realizes the closed part and reopens at the fill price.
+- **Funding** is paid on the shared account position, so each strategy is allocated the share equal to its size over the
+  account's size, booked before any size change and every minute, with a cursor so a payment is never counted twice.
+  `position.funding_paid_usd` is positive when paid; `/value`'s `funding_usd` is the net received (the sign flips).
+  *Not yet seen live: the funding rate of `xyz:GOLD` has been 0, so the real funding-history entry shape is unverified.*
+- **`GET /strategies/{id}/value`**: `{margin_usd, unrealized_pnl_usd, realized_pnl_usd, funding_usd, fees_usd, value_usd,
+  hedge_pnl_usd, as_of, attestation_sig, attestation_url, market_closed}`. `value_usd = margin_usd + unrealized_pnl_usd`
+  (the literal v4 definition); `hedge_pnl_usd = unrealized + realized + funding - fees` and **never includes margin**. All
+  five components are independently populated. A strategy with no position reports zeros; a venue outage is
+  `VENUE_UNAVAILABLE` (503), never a wrong number.
+- **`GET /strategies/{id}/value?as_of=<time>`** (ISO 8601, a naive time is UTC, or Unix milliseconds): the stored P&L
+  snapshot at or just before that time. Snapshots are taken **every minute** and **after every action** (deploy, deposit,
+  edit, rebalance), so history is never recomputed. `as_of` in the response is the snapshot's own time. Before the first
+  snapshot it is a 404. `attestation_sig` is the latest attestation in force at that moment.
+- **`GET /strategies/{id}/history`**: every action, oldest first: type, time, who signed it, the fill (size, average
+  price, remaining), fee, realized P&L, Hyperliquid order ids, the Solana signature (for `deploy`, the funding
+  transfer), the attestation signature and its explorer URL, and the full record.
+- **Numbers** in responses are JSON numbers rounded to 8 decimals.
+
 ## Signed-message authorization and strategy ownership
 
 Strategy actions that move nothing on Solana (edit hedge settings, rebalance, close, return excess, change owner) are
@@ -190,40 +226,43 @@ sereel-strategy-v1|solana|<wallet_pubkey>|<action>|<strategy_id>|<params_hash>|<
 `params_hash` is the **lowercase hex SHA-256 of the canonical params text**, encoded as UTF-8. The params are an object
 holding exactly the fields the action lists below, *with the values the request body carries*, and nothing more.
 
-1. **Sorted keys.** Object keys are sorted (by Unicode code point) at every level.
-2. **No whitespace** anywhere: `{"a":"1","b":2}`, never `{ "a": "1", "b": 2 }`.
-3. **Amounts, prices and quantities are decimal strings**, never JSON numbers: `"520.5"`, not `520.5`. A decimal string
-   is digits with an optional fractional part of 1 to 18 digits: no sign, no exponent, no leading zeros, no trailing
-   dot (`"0"`, `"1250.75"`, `"0.000001"` are valid; `"+1"`, `"-1"`, `"1e3"`, `"01"`, `"1."`, `".5"` are not). The string
-   is hashed exactly as sent: `"520"` and `"520.0"` are different strings and hash differently.
-4. **Whole-number fields** (basis points) are JSON **integers**: `7000`, never `7000.0` or `"7000"`.
-5. **No floats anywhere.** A JSON number where a decimal string belongs, or a float where an integer belongs, is rejected
-   with **`AUTHORIZATION_INVALID`**. This is deliberate: two clients can print the same number differently
-   (`520.0` vs `520`, `1e-7` vs `0.0000001`) and would sign different bytes.
-6. **Strings** are escaped as `JSON.stringify` does (`"`, `\`, control characters as `\n` / `\u00XX`); non-ASCII
+1. **A flat object whose values are all strings.** There are no nested values, numbers, booleans or nulls in signed params.
+2. **Sorted keys.** Keys are sorted (by Unicode code point).
+3. **No whitespace** anywhere: `{"a":"1","b":"2"}`, never `{ "a": "1", "b": "2" }`.
+4. **No JSON numbers, anywhere, for any field.** This includes whole numbers: `hedge_ratio_bps` is sent and signed as
+   the string `"6000"`, and the JSON number `6000` is **rejected with `AUTHORIZATION_INVALID`**. This is deliberate: two
+   clients can print the same number differently (`520.0` vs `520`, `1e-7` vs `0.0000001`) and would sign different
+   bytes; a string is the same bytes everywhere.
+5. **Amounts, prices and quantities are decimal strings:** `"520.5"`. A decimal string is digits with an optional
+   fractional part of 1 to 18 digits: no sign, no exponent, no leading zeros, no trailing dot (`"0"`, `"1250.75"`,
+   `"0.000001"` are valid; `"+1"`, `"-1"`, `"1e3"`, `"01"`, `"1."`, `".5"` are not). The string is hashed exactly as
+   sent: `"520"` and `"520.0"` are different strings and hash differently.
+6. **Whole numbers (basis points) are digit strings:** `"6000"`. Digits only, at most 15, no sign, fraction or leading
+   zeros (`"0"` is valid; `"06000"`, `"6000.0"`, `"-1"` are not).
+7. **Strings** are escaped as `JSON.stringify` does (`"`, `\`, control characters as `\n` / `\u00XX`); non-ASCII
    characters are written as is (UTF-8), not as `\uXXXX`.
-7. The server hashes the values it read from the **raw request body**, so what you hash must be what you send.
+8. The server hashes the values it read from the **raw request body**, so what you hash must be what you send.
 
 Field types (anything else is not signable and is rejected):
 
 | Field | Type |
 |---|---|
-| `target_exposure_units`, `amount_usd` | decimal string |
-| `hedge_ratio_bps` | integer |
+| `target_exposure_units`, `amount_usd` | decimal string, e.g. `"520.5"` |
+| `hedge_ratio_bps` | whole-number string, e.g. `"6000"` |
 | `destination_wallet_address`, `owner_pubkey`, `owner_multisig` | string |
 
 Actions, their endpoints, and exactly which fields are hashed (only those present in the body):
 
 | Action | Endpoint | params |
 |---|---|---|
-| `edit_hedge_settings` | `PATCH /strategies/{id}` | `hedge_ratio_bps` (integer), `target_exposure_units` (decimal string) |
+| `edit_hedge_settings` | `PATCH /strategies/{id}` | `hedge_ratio_bps` (whole-number string), `target_exposure_units` (decimal string) |
 | `rebalance` | `POST /strategies/{id}/rebalance` | `{}` |
 | `return_excess` | `POST /strategies/{id}/withdrawals` | `amount_usd` (decimal string), `destination_wallet_address` |
 | `close_strategy` | `DELETE /strategies/{id}` | `destination_wallet_address` |
 | `change_owner` | `POST /strategies/{id}/owner` | one of `owner_pubkey` / `owner_multisig` |
 
-Note: for `edit_hedge_settings` the v4 draft sent `target_exposure_units` as a JSON number; it must now be sent (and
-signed) as a decimal string.
+Note: the v4 draft sent `hedge_ratio_bps` and `target_exposure_units` (PATCH) and `amount_usd` (withdrawals) as JSON
+numbers. In the request body of these signed actions they must now be **strings**, and the same strings are what you sign.
 
 ### Test vectors
 
@@ -241,10 +280,10 @@ timestamp           1759577234123
 **Vector 1: `edit_hedge_settings`**
 
 ```
-params (canonical)  {"hedge_ratio_bps":7000,"target_exposure_units":"520.5"}
-params_hash         470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104
-message             sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|edit_hedge_settings|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123
-signature (base58)  wDzgfP9LujamT86N5oFrhgQTbTMxCH8MAppFqHFKCBceUssdgCtu4sNmPQu6FpGQ8T18va333LTyc6YDQNwk7Q8
+params (canonical)  {"hedge_ratio_bps":"6000","target_exposure_units":"520.5"}
+params_hash         9ec3238301cff9109a844324fff25a476d690ff16ab22969bbb88e9ac4a4d9aa
+message             sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|edit_hedge_settings|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|9ec3238301cff9109a844324fff25a476d690ff16ab22969bbb88e9ac4a4d9aa|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123
+signature (base58)  3BhmB6sWKXB3XUJdkd4Z7UUaacLYoVVZF7QSFuL8qoR6xfmUBmoYxCoD2gHhjUjexDzGTtPfy1h52frDTpxHhbSu
 ```
 
 **Vector 2: `return_excess`**
@@ -310,6 +349,7 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `NOT_CONFIGURED` | 503 | a required setting is missing (e.g. STABLECOIN_MINT) |
 | `UNKNOWN_MARKET` | 404 | the market id is not in markets.yaml (or not found on the venue) |
 | `ORDER_NOT_FILLED` | 400 | no fill after the IOC retries, or the venue rejected the order |
+| `VENUE_UNAVAILABLE` | 503 | the venue could not be reached or returned no price, so a live value cannot be computed |
 | `LEVERAGE_NOT_SET` | 503 | the venue did not confirm the configured leverage for the market, so no order was sent |
 | `VENUE_NOT_CONFIGURED` | 503 | Hyperliquid credentials are not set |
 | `PRICE_SOURCE_AUTH` | 502 | Pyth Hermes rejected the credentials (PYTH_API_KEY) |

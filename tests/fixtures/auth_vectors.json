@@ -8,13 +8,13 @@
   {
    "action": "edit_hedge_settings",
    "params": {
-    "hedge_ratio_bps": 7000,
+    "hedge_ratio_bps": "6000",
     "target_exposure_units": "520.5"
    },
-   "canonical": "{\"hedge_ratio_bps\":7000,\"target_exposure_units\":\"520.5\"}",
-   "params_hash": "470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104",
-   "message": "sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|edit_hedge_settings|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|470d3a4a3a5e4cc61dc9ebc0f745606045f8ff6095f9bdb2305a0d8f1ddf9104|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123",
-   "signature": "wDzgfP9LujamT86N5oFrhgQTbTMxCH8MAppFqHFKCBceUssdgCtu4sNmPQu6FpGQ8T18va333LTyc6YDQNwk7Q8"
+   "canonical": "{\"hedge_ratio_bps\":\"6000\",\"target_exposure_units\":\"520.5\"}",
+   "params_hash": "9ec3238301cff9109a844324fff25a476d690ff16ab22969bbb88e9ac4a4d9aa",
+   "message": "sereel-strategy-v1|solana|FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF|edit_hedge_settings|5b5e4c52-8f1a-4d0e-9a53-2f6f3e1c7a10|9ec3238301cff9109a844324fff25a476d690ff16ab22969bbb88e9ac4a4d9aa|0b1f6c7e-3a2d-4c1b-9e8f-7d6c5b4a3921|1759577234123",
+   "signature": "3BhmB6sWKXB3XUJdkd4Z7UUaacLYoVVZF7QSFuL8qoR6xfmUBmoYxCoD2gHhjUjexDzGTtPfy1h52frDTpxHhbSu"
   },
   {
    "action": "return_excess",

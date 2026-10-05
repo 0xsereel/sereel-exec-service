@@ -27,6 +27,7 @@ class SimulatedVenue(VenueAdapter):
         self.price_override: dict[str, Decimal] = {}
         self._lev: dict[str, dict] = {}
         self.orders: list[dict] = []  # every order sent, for tests
+        self.funding_log: list[tuple[int, Decimal]] = []  # tests append (time_ms, signed usd) here
 
     def size_decimals(self, market_id):
         return 4
@@ -35,6 +36,9 @@ class SimulatedVenue(VenueAdapter):
         if market_id in self.price_override:
             return self.price_override[market_id]
         return pyth.get_price(self.market(market_id).pyth_feed_id, None).price
+
+    def funding_entries(self, market_id, since_ms):
+        return [(ms, usd) for ms, usd in self.funding_log if ms > since_ms]
 
     def leverage_status(self, market_id):
         return self._lev.get(market_id, {"leverage": 20, "mode": "cross"})  # the venue default before we set it

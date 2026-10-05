@@ -40,6 +40,7 @@ class Partial:
     filled: Decimal  # signed, measured from the position, not from the order response
     avg_px: Decimal | None
     oid: str | None
+    reduce_only: bool = False
 
 
 @dataclass
@@ -106,8 +107,12 @@ class VenueAdapter(ABC):
     def maintenance_rate(self, market_id: str) -> Decimal:
         return Decimal("0.02")
 
+    def funding_entries(self, market_id: str, since_ms: int) -> list[tuple[int, Decimal]]:
+        """Funding payments on the shared account position after since_ms: [(time_ms, signed usd)], negative = paid."""
+        return []
+
     def funding_since(self, market_id: str, since_ms: int) -> Decimal:
-        return Decimal(0)
+        return sum((usd for _, usd in self.funding_entries(market_id, since_ms)), Decimal(0))
 
     def margin_balance(self, market_id: str) -> Decimal:
         return self.position(None, market_id).account_value
@@ -156,7 +161,7 @@ class VenueAdapter(ABC):
                 limit = mark * (1 + slippage if is_buy else 1 - slippage)
                 avg_px, oid = self._ioc(market_id, is_buy, size, limit, reduce_only)
                 got = self.position(strategy_id, market_id).size - before
-                report.partials.append(Partial(attempt, limit, got, avg_px, oid))
+                report.partials.append(Partial(attempt, limit, got, avg_px, oid, reduce_only))
                 if oid:
                     report.oids.append(oid)
                 if got:

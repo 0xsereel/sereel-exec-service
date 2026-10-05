@@ -6,7 +6,7 @@ watcher.py); the client never submits a signature.
 """
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from pydantic import BaseModel
@@ -19,7 +19,7 @@ from ..config import settings
 from ..db import engine
 from ..errors import ServiceError
 from ..models import (D_CANCELLED, D_CONFIRMED, D_EXPIRED, D_PENDING, S_ACTIVE, S_CANCELLED, S_CLOSING, S_EXPIRED, S_FAILED,
-                      S_PENDING, S_REBALANCING, Action, Strategy, StrategyDeposit, now)
+                      S_PENDING, S_REBALANCING, Action, PnlSnapshot, Strategy, StrategyDeposit, now)
 from ..state import state
 from ..util import iso, num
 from ..venue.base import account_lock
@@ -252,7 +252,7 @@ def change_owner(sid: str, params: dict, authorization, org: str = "") -> Strate
     record = {"event": "change_owner", "from": before, "to": {"owner_pubkey": new_pubkey, "owner_multisig": new_multisig},
               "signed_by": signer, "authorization_nonce": (authorization or {}).get("nonce"),
               "authorization_timestamp": (authorization or {}).get("timestamp")}
-    asig = _record_action(sid, "change_owner", record, fund)
+    asig = _record_action(sid, "change_owner", record, fund, signed_by=signer, authorization=authorization)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         st.last_attestation_sig = asig
@@ -338,11 +338,14 @@ def reconcile() -> dict:
 # ---- refunds ----------------------------------------------------------------
 
 def _record_action(strategy_id: str, action: str, record: dict, fund_id: str, solana_signature: str | None = None,
-                   hl_order_ids: list | None = None) -> str | None:
-    sig = att.attest(strategy_id, fund_id, action, record)
+                   hl_order_ids: list | None = None, signed_by: str | None = None, authorization: dict | None = None,
+                   attest: bool = True) -> str | None:
+    """Store the full record and (unless attest=False) attest its hash on Solana. Returns the attestation signature."""
+    sig = att.attest(strategy_id, fund_id, action, record) if attest else None
     with Session(engine) as s:
         s.add(Action(strategy_id=strategy_id, action=action, record=att.jsonable(record), solana_signature=solana_signature,
-                     hl_order_ids=hl_order_ids or [], attestation_sig=sig))
+                     hl_order_ids=hl_order_ids or [], attestation_sig=sig, signer_public_key=signed_by,
+                     authorization=authorization))
         s.commit()
     return sig
 
@@ -410,6 +413,7 @@ def activate(sid: str) -> str:
                 st.hl_order_ids = list(fill.oids) if fill else []
                 st.margin_usd, st.status, st.failure_reason = received, S_ACTIVE, None
                 st.deployed_at = st.updated_at = now()
+                st.funding_cursor_ms = int(time.time() * 1000)  # funding before the position existed is not ours
                 s.add(st)
                 s.commit()
                 record = {"event": "deploy", "target_size": size, "filled": st.size, "remaining": fill.remaining if fill else 0,
@@ -427,6 +431,7 @@ def activate(sid: str) -> str:
             st.last_attestation_sig = asig
             s.add(st)
             s.commit()
+        take_snapshot(sid, "deploy")
         return "active"
     _fail_and_refund(sid, reason)
     return "failed"
@@ -502,6 +507,7 @@ def confirm_deposit(did: str) -> None:
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
+    take_snapshot(sid, "deposit")
 
 
 def dep_signature(did: str) -> str | None:
@@ -543,6 +549,327 @@ def expire_due() -> int:
                 log.error("REFUND FAILED for expired deposit %s: %s", did, e)
         n += 1
     return n
+
+
+# ---- the fill ledger, funding and P&L snapshots -----------------------------
+
+def apply_fill(st: Strategy, delta: Decimal, px: Decimal, fee: Decimal) -> Decimal:
+    """Book a fill of signed size `delta` at `px` into the strategy ledger; returns the realized P&L it produced.
+    Growing a position blends the entry price; shrinking realizes P&L on the part closed (at the unchanged entry);
+    flipping through zero realizes the closed part and opens the remainder at `px`."""
+    old, realized = st.size, Decimal(0)
+    if delta == 0:
+        return realized
+    if old == 0 or (old > 0) == (delta > 0):  # opening or growing
+        st.entry_px = ((abs(old) * st.entry_px + abs(delta) * px) / (abs(old) + abs(delta))) if old else px
+    else:
+        closed = min(abs(delta), abs(old))
+        realized = (px - st.entry_px) * closed * (1 if old > 0 else -1)  # long gains when px rises, short when it falls
+        if abs(delta) > abs(old):  # flipped: the remainder opens at px
+            st.entry_px = px
+    st.size = old + delta
+    if st.size == 0:
+        st.entry_px = Decimal(0)
+    st.realized_pnl_usd += realized
+    st.fees_usd += fee
+    return realized
+
+
+def accrue_funding(sid: str) -> Decimal:
+    """Book funding payments since this strategy's cursor. Funding is paid on the shared account position, so a strategy
+    gets the share equal to its size over the account's size. Call BEFORE changing the size, so the share is right."""
+    v = venue()
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        if st.status not in LIVE or st.size == 0:
+            return Decimal(0)
+        cursor = st.funding_cursor_ms or int(st.deployed_at.timestamp() * 1000)
+        entries = v.funding_entries(st.market_id, cursor)
+        if not entries:
+            return Decimal(0)
+        account = abs(v.position(None, st.market_id).size)
+        share = min(abs(st.size) / account, Decimal(1)) if account else Decimal(0)
+        paid = sum((usd for _, usd in entries), Decimal(0)) * share
+        st.funding_usd += paid
+        st.funding_cursor_ms = max(ms for ms, _ in entries)  # strictly-after on the next call: nothing counted twice
+        s.add(st)
+        s.commit()
+        return paid
+
+
+def values(st: Strategy, mark: Decimal | None) -> dict:
+    """The v4 /value numbers. value_usd is margin + unrealized (the literal original definition); hedge_pnl is what
+    the strategy earned and never includes margin, which is fund cash that merely moved."""
+    unrealized = (mark - st.entry_px) * st.size if (mark is not None and st.size) else Decimal(0)
+    hedge = unrealized + st.realized_pnl_usd + st.funding_usd - st.fees_usd
+    return {"margin": st.margin_usd, "unrealized": unrealized, "realized": st.realized_pnl_usd, "funding": st.funding_usd,
+            "fees": st.fees_usd, "value": st.margin_usd + unrealized, "hedge_pnl": hedge}
+
+
+def take_snapshot(sid: str, cause: str) -> bool:
+    """Store the P&L right now (every minute, and after every action). False if the venue price is unavailable."""
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        if st is None:
+            return False
+        mark = None
+        if st.status in LIVE and st.size != 0:
+            try:
+                mark = venue().mark_price(st.market_id)
+            except Exception as e:
+                log.warning("snapshot of %s skipped, no mark: %s", sid, e)
+                return False
+        v = values(st, mark)
+        s.add(PnlSnapshot(strategy_id=sid, unrealized_pnl_usd=v["unrealized"], realized_pnl_usd=v["realized"],
+                          funding_usd=v["funding"], fees_usd=v["fees"], hedge_pnl_usd=v["hedge_pnl"], margin_usd=v["margin"],
+                          cause=cause))
+        s.commit()
+        return True
+
+
+def snapshot_all() -> int:
+    """The once-a-minute job: accrue funding, then snapshot every strategy that holds a position."""
+    with Session(engine) as s:
+        ids = [x for x in s.exec(select(Strategy.id).where(Strategy.status.in_(LIVE))).all()]
+    n = 0
+    for sid in ids:
+        try:
+            accrue_funding(sid)
+            n += take_snapshot(sid, "tick")
+        except Exception:
+            log.exception("snapshot of %s failed", sid)
+    return n
+
+
+def recover_interrupted() -> int:
+    """A crash mid-rebalance leaves status 'rebalancing'. Put it back to active; ledger drift (a fill whose commit was
+    lost) is then caught by the drift guard before anything else trades."""
+    with Session(engine) as s:
+        rows = s.exec(select(Strategy).where(Strategy.status == S_REBALANCING)).all()
+        for st in rows:
+            log.warning("strategy %s was interrupted mid-rebalance; marking it active (check /health reconciliation)", st.id)
+            st.status = S_ACTIVE
+            s.add(st)
+        s.commit()
+        return len(rows)
+
+
+# ---- edit settings and rebalance ---------------------------------------------
+
+def _parse_edit(params: dict) -> tuple[int | None, Decimal | None]:
+    """Business validation of PATCH fields (they are already known to be well-formed strings)."""
+    if not params:
+        raise _bad("send hedge_ratio_bps and/or target_exposure_units")
+    ratio = int(params["hedge_ratio_bps"]) if "hedge_ratio_bps" in params else None
+    exposure = Decimal(params["target_exposure_units"]) if "target_exposure_units" in params else None
+    if ratio is not None and not 0 <= ratio <= 10_000:
+        raise _bad("hedge_ratio_bps must be between 0 and 10000")
+    if exposure is not None and exposure <= 0:
+        raise _bad("target_exposure_units must be positive")
+    return ratio, exposure
+
+
+def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strategy:
+    """PATCH: change the hedge ratio and/or exposure. Moves the TARGET only; no order is sent (that is rebalance)."""
+    ratio, exposure = _parse_edit(params)
+    st = get_strategy(sid, org)
+    if st.status != S_ACTIVE:
+        raise ServiceError("CONFLICT", f"strategy is {st.status}; settings can only be edited while it is active", 409)
+    st, signer = authorize_action(sid, "edit_hedge_settings", authorization, params, org)
+    mark = venue().mark_price(st.market_id)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        before = {"hedge_ratio_bps": st.hedge_ratio_bps, "target_exposure_units": st.target_exposure_units,
+                  "required_margin_usd": st.required_margin_usd}
+        if ratio is not None:
+            st.hedge_ratio_bps = ratio
+        if exposure is not None:
+            st.target_exposure_units = exposure
+        st.required_margin_usd = required_margin(target_size(st), mark, st.leverage)
+        st.updated_at = now()
+        s.add(st)
+        s.commit()
+        after = {"hedge_ratio_bps": st.hedge_ratio_bps, "target_exposure_units": st.target_exposure_units,
+                 "required_margin_usd": st.required_margin_usd}
+        fund, size, target = st.fund_id, st.size, target_size(st)
+    record = {"event": "edit_hedge_settings", "from": before, "to": after, "target_size": target, "current_size": size,
+              "signed_by": signer, "authorization_nonce": (authorization or {}).get("nonce")}
+    asig = _record_action(sid, "edit_hedge_settings", record, fund, signed_by=signer, authorization=authorization)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        st.last_attestation_sig = asig
+        s.add(st)
+        s.commit()
+    take_snapshot(sid, "edit_hedge_settings")
+    return get_strategy(sid, org)
+
+
+def hedge_gap(st: Strategy) -> tuple[Decimal, int]:
+    """(target short - current short in units, gap as basis points of the target). Positive = under-hedged."""
+    target = target_size(st)
+    gap = target - (-st.size)
+    if target == 0:
+        return gap, 10_000 if st.size != 0 else 0
+    return gap, int(abs(gap) / target * 10_000)
+
+
+def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> Strategy:
+    """Move the hedge to its target if the gap is beyond the strategy's rebalance band (or `force`). Shrinking is
+    reduce-only; growing needs the strategy's own capital to cover the new size at its leverage."""
+    st = get_strategy(sid, org)
+    if st.status != S_ACTIVE:
+        raise ServiceError("CONFLICT", f"strategy is {st.status}; only an active strategy can be rebalanced", 409)
+    st, signer = authorize_action(sid, "rebalance", authorization, {}, org)
+    v = venue()
+    nonce = (authorization or {}).get("nonce")
+    with account_lock(v.account_key):
+        with Session(engine) as s:
+            st = s.get(Strategy, sid)
+            if st.status != S_ACTIVE:  # something else changed it while we waited for the lock
+                raise ServiceError("CONFLICT", f"strategy is {st.status}", 409)
+            gap, gap_bps = hedge_gap(st)
+            quantum = Decimal(1).scaleb(-v.size_decimals(st.market_id))
+            if abs(gap) < quantum or (not force and gap_bps <= st.rebalance_band_bps):
+                reason = "already at target" if abs(gap) < quantum else f"gap {gap_bps} bps is within the {st.rebalance_band_bps} bps band"
+                fund = st.fund_id
+                noop = True
+            else:
+                noop = False
+                market_id, current_size = st.market_id, st.size  # read now: the session closes before the order is sent
+                target_signed = -target_size(st)
+                growing = abs(target_signed) > abs(st.size)
+                mark = v.mark_price(st.market_id)
+                if growing:
+                    cash = st.margin_usd + st.realized_pnl_usd + st.funding_usd - st.fees_usd
+                    needed = abs(target_signed) * mark / st.leverage
+                    if needed > cash:
+                        raise ServiceError("INSUFFICIENT_MARGIN", f"a {abs(target_signed)} short at {st.leverage}x needs {needed:.2f} USD "
+                                           f"but the strategy holds {cash:.2f}; add margin with a top-up first")
+                if ledger_drift(s, st.market_id):
+                    raise ServiceError("CONFLICT", "the venue position differs from the ledger; rebalancing is held until it is reconciled", 409)
+                st.status = S_REBALANCING
+                s.add(st)
+                s.commit()
+        if noop:
+            _record_action(sid, "rebalance", {"event": "rebalance", "traded": False, "reason": reason, "gap_units": gap,
+                                              "gap_bps": gap_bps, "signed_by": signer, "authorization_nonce": nonce},
+                           fund, signed_by=signer, authorization=authorization, attest=False)  # nothing happened on the venue
+            return get_strategy(sid, org)
+        accrue_funding(sid)  # before the size changes, so the funding share is right
+        with Session(engine) as s:
+            current_size = s.get(Strategy, sid).size  # accrual does not change it, but read it fresh under the lock anyway
+        try:
+            fill = v.set_position(sid, market_id, target_signed, current_size=current_size)
+        except ServiceError:
+            _restore_active(sid)
+            raise
+        with Session(engine) as s:
+            st = s.get(Strategy, sid)
+            before = {"size": st.size, "entry_px": st.entry_px}
+            realized = apply_fill(st, fill.filled, fill.avg_px or mark, fill.fee)
+            st.hl_order_ids = list(st.hl_order_ids or []) + list(fill.oids)
+            st.status, st.updated_at = S_ACTIVE, now()
+            s.add(st)
+            s.commit()
+            fund = st.fund_id
+            record = {"event": "rebalance", "traded": True, "forced": force, "from": before, "target_size": target_signed,
+                      "filled": fill.filled, "remaining": fill.remaining, "avg_px": fill.avg_px, "fee": fill.fee,
+                      "realized_pnl_usd": realized, "size_after": st.size, "entry_px_after": st.entry_px, "hl_oids": fill.oids,
+                      "reduce_only": [p.reduce_only for p in fill.partials], "signed_by": signer, "authorization_nonce": nonce,
+                      "market_closed": v.market_closed.get(market_id, False)}
+            oids = list(fill.oids)
+    asig = _record_action(sid, "rebalance", record, fund, hl_order_ids=oids, signed_by=signer, authorization=authorization)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        st.last_attestation_sig = asig
+        s.add(st)
+        s.commit()
+    take_snapshot(sid, "rebalance")
+    return get_strategy(sid, org)
+
+
+def _restore_active(sid: str) -> None:
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        if st and st.status == S_REBALANCING:
+            st.status = S_ACTIVE
+            s.add(st)
+            s.commit()
+
+
+# ---- /value and /history ------------------------------------------------------
+
+def parse_as_of(text: str) -> datetime:
+    """ISO 8601 (a naive time is UTC) or Unix milliseconds."""
+    text = text.strip()
+    try:
+        if text.isdigit():
+            return datetime.fromtimestamp(int(text) / 1000, tz=timezone.utc)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (ValueError, OverflowError, OSError):
+        raise _bad(f"as_of '{text}' is not an ISO 8601 time or Unix milliseconds")
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _last_attestation_before(s: Session, sid: str, at: datetime | None) -> str | None:
+    q = select(Action).where(Action.strategy_id == sid, Action.attestation_sig.is_not(None)).order_by(Action.created_at.desc())
+    if at is not None:
+        q = q.where(Action.created_at <= at)
+    a = s.exec(q).first()
+    return a.attestation_sig if a else None
+
+
+def _value_out(v: dict, as_of: datetime, attestation_sig: str | None, market_closed: bool | None) -> dict:
+    return {"margin_usd": num(v["margin"]), "unrealized_pnl_usd": num(v["unrealized"]), "realized_pnl_usd": num(v["realized"]),
+            "funding_usd": num(v["funding"]), "fees_usd": num(v["fees"]), "value_usd": num(v["value"]),
+            "hedge_pnl_usd": num(v["hedge_pnl"]),  # unrealized + realized + funding - fees; margin is never in it
+            "as_of": iso(as_of), "attestation_sig": attestation_sig,
+            "attestation_url": sol.explorer_url(attestation_sig) if attestation_sig else None, "market_closed": market_closed}
+
+
+def strategy_value(sid: str, org: str = "", as_of: str | None = None) -> dict:
+    st = get_strategy(sid, org)
+    if as_of is None:  # live
+        mark = None
+        if st.status in LIVE and st.size != 0:
+            mark = mark_for(st.market_id)
+            if mark is None:
+                raise ServiceError("VENUE_UNAVAILABLE", "the venue returned no price, so a live value cannot be computed", 503)
+        with Session(engine) as s:
+            asig = st.last_attestation_sig or _last_attestation_before(s, sid, None)
+        return _value_out(values(st, mark), now(), asig, bool(venue().market_closed.get(st.market_id, False)))
+    at = parse_as_of(as_of)
+    with Session(engine) as s:
+        snap = s.exec(select(PnlSnapshot).where(PnlSnapshot.strategy_id == sid, PnlSnapshot.ts <= at)
+                      .order_by(PnlSnapshot.ts.desc(), PnlSnapshot.id.desc())).first()
+        if snap is None:
+            raise ServiceError("NOT_FOUND", f"no snapshot of this strategy at or before {iso(at)}", 404)
+        asig = _last_attestation_before(s, sid, snap.ts)
+        v = {"margin": snap.margin_usd, "unrealized": snap.unrealized_pnl_usd, "realized": snap.realized_pnl_usd,
+             "funding": snap.funding_usd, "fees": snap.fees_usd, "value": snap.margin_usd + snap.unrealized_pnl_usd,
+             "hedge_pnl": snap.hedge_pnl_usd}
+        ts = snap.ts
+    return _value_out(v, ts, asig, None)
+
+
+def strategy_history(sid: str, org: str = "") -> list[dict]:
+    """Every action, oldest first: who signed it, the fill, fee, venue order ids, and the Solana signatures."""
+    get_strategy(sid, org)
+    with Session(engine) as s:
+        actions = s.exec(select(Action).where(Action.strategy_id == sid).order_by(Action.created_at, Action.id)).all()
+    out = []
+    for a in actions:
+        r = a.record or {}
+        dec = lambda k: num(Decimal(r[k])) if r.get(k) not in (None, "") else None
+        fill = {"size": dec("filled"), "avg_price_usd": dec("avg_px") if r.get("avg_px") else dec("entry_px"),
+                "remaining": dec("remaining")} if r.get("filled") not in (None, "") else None
+        out.append({"id": a.id, "type": a.action, "created_at": iso(a.created_at), "signed_by": a.signer_public_key,
+                    "fill": fill, "fee_usd": dec("fee"), "realized_pnl_usd": dec("realized_pnl_usd"),
+                    "hl_order_ids": list(a.hl_order_ids or []),
+                    "solana_signature": a.solana_signature or r.get("funding_signature"),
+                    "attestation_signature": a.attestation_sig,
+                    "attestation_url": sol.explorer_url(a.attestation_sig) if a.attestation_sig else None, "details": r})
+    return out
 
 
 # ---- serialisation (Cantina v4 shapes) -------------------------------------
@@ -603,7 +930,8 @@ def position_out(st: Strategy, mark: Decimal | None) -> dict | None:
     return {"side": "short" if size < 0 else "long" if size > 0 else "flat", "size_units": num(magnitude),
             "entry_price_usd": num(st.entry_px), "mark_price_usd": num(mark), "margin_usd": num(st.margin_usd),
             "unrealized_pnl_usd": num(unrealized), "realized_pnl_usd": num(st.realized_pnl_usd),
-            "funding_paid_usd": num(st.funding_usd), "fees_usd": num(st.fees_usd), "margin_health_bps": health,
+            # funding_paid_usd is positive when PAID; /value's funding_usd is the net amount received (the sign flips)
+            "funding_paid_usd": num(-st.funding_usd), "fees_usd": num(st.fees_usd), "margin_health_bps": health,
             "maintenance_margin_usd": num(maintenance), "liquidation_price_usd": num(liq),
             "hl_order_ids": list(st.hl_order_ids or [])}
 
@@ -613,6 +941,7 @@ def strategy_out(st: Strategy) -> dict:
     size = target_size(st)
     received = st.received_amount_usd
     shortfall = max(st.expected_amount_usd - received, Decimal(0)) if received is not None and st.status == S_PENDING else None
+    gap_units, gap_bps = hedge_gap(st) if st.status in LIVE else (None, None)
     return {
         "id": st.id, "template": st.template, "status": st.status, "fund_id": st.fund_id, "fund_name": st.fund_name,
         "market_id": st.market_id, "market_symbol": st.market_symbol, "hedge_ratio_bps": st.hedge_ratio_bps,
@@ -627,6 +956,7 @@ def strategy_out(st: Strategy) -> dict:
         "created_at": iso(st.created_at), "updated_at": iso(st.updated_at),
         "deployed_at": iso(st.deployed_at), "closed_at": iso(st.closed_at), "position": position_out(st, mark),
         "market_closed": bool(venue().market_closed.get(st.market_id, False)), "failure_reason": st.failure_reason,
+        "hedge_gap_units": num(gap_units), "hedge_gap_bps": gap_bps,  # target short minus current short; > 0 = under-hedged
     }
 
 

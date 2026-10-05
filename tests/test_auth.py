@@ -40,19 +40,19 @@ def clean():
 # ---- canonical JSON / hash / message ---------------------------------------
 
 @pytest.mark.parametrize("obj,expected", [
-    ({}, "{}"), ([], "[]"), (None, "null"), (True, "true"), (False, "false"), (7000, "7000"), (0, "0"), (-5, "-5"),
-    ({"b": 1, "a": {"d": 2, "c": [3, {"z": 1, "y": 2}]}}, '{"a":{"c":[3,{"y":2,"z":1}],"d":2},"b":1}'),  # keys sorted recursively
-    ("520.5", '"520.5"'),  # a decimal string stays a string
+    ({}, "{}"), ([], "[]"), ("", '""'), ("520.5", '"520.5"'), ("6000", '"6000"'),
+    ({"b": "1", "a": {"d": "2", "c": ["3", {"z": "1", "y": "2"}]}}, '{"a":{"c":["3",{"y":"2","z":"1"}],"d":"2"},"b":"1"}'),  # sorted
     ("a\"b\\c\n\t\u0001é€", '"a\\"b\\\\c\\n\\t\\u0001é€"'),  # JSON.stringify escapes, non-ASCII left alone
-    ({"hedge_ratio_bps": 7000, "target_exposure_units": "520.5"}, '{"hedge_ratio_bps":7000,"target_exposure_units":"520.5"}'),
-    ([1, [2, [3]], {"a": [True, None]}], '[1,[2,[3]],{"a":[true,null]}]'),
+    ({"hedge_ratio_bps": "6000", "target_exposure_units": "520.5"}, '{"hedge_ratio_bps":"6000","target_exposure_units":"520.5"}'),
 ])
 def test_canonical_json_format(obj, expected):
     assert auth.canonical_json(obj) == expected
 
 
-@pytest.mark.parametrize("bad", [0.6, 520.0, -0.0, 1e21, float("nan"), float("inf"), 2 ** 53, Decimal("1.5"), b"bytes", object()])
-def test_canonical_json_refuses_floats_decimals_and_unsafe_integers(bad):
+@pytest.mark.parametrize("bad", [6000, 0, -5, 0.6, 520.0, -0.0, 1e21, float("nan"), float("inf"), 2 ** 53, True, False, None,
+                                 Decimal("1.5"), b"bytes", object()])
+def test_canonical_json_refuses_every_non_string_value(bad):
+    """Numbers (whole or not), booleans and null cannot appear in signed params at all."""
     with pytest.raises(ValueError):
         auth.canonical_json(bad)
     with pytest.raises(ValueError):
@@ -63,7 +63,9 @@ def test_params_hash_is_lowercase_hex_sha256_of_the_canonical_text():
     assert auth.params_hash({}) == "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"  # sha256("{}")
     p = {"amount_usd": "12.5", "destination_wallet_address": "abc"}
     assert auth.params_hash(p) == hashlib.sha256(b'{"amount_usd":"12.5","destination_wallet_address":"abc"}').hexdigest()
-    assert auth.params_hash({"b": 1, "a": 2}) == auth.params_hash({"a": 2, "b": 1})  # order of keys does not matter
+    assert auth.params_hash({"b": "1", "a": "2"}) == auth.params_hash({"a": "2", "b": "1"})  # order of keys does not matter
+    with pytest.raises(ValueError):
+        auth.params_hash({"b": 1})  # a number cannot even be hashed
 
 
 def test_message_format_is_exactly_the_contract():
@@ -112,16 +114,16 @@ def test_malformed_authorization_is_invalid(mutate):
 
 
 def test_the_signature_binds_action_strategy_and_params():
-    a = sign("edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": "520"})
-    check(a, "edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": "520"})
+    a = sign("edit_hedge_settings", {"hedge_ratio_bps": "7000", "target_exposure_units": "520"})
+    check(a, "edit_hedge_settings", {"hedge_ratio_bps": "7000", "target_exposure_units": "520"})
     for kw in (dict(action="rebalance", params={}),  # same signature replayed as a different action
                dict(sid="strategy-2"),  # ... on a different strategy
-               dict(params={"hedge_ratio_bps": 9999, "target_exposure_units": "520"}),  # ... or with tampered params
-               dict(params={"hedge_ratio_bps": 7000})):  # ... or with a field dropped
-        args = dict(action="edit_hedge_settings", params={"hedge_ratio_bps": 7000, "target_exposure_units": "520"}, sid=SID)
+               dict(params={"hedge_ratio_bps": "9999", "target_exposure_units": "520"}),  # ... or with tampered params
+               dict(params={"hedge_ratio_bps": "7000"})):  # ... or with a field dropped
+        args = dict(action="edit_hedge_settings", params={"hedge_ratio_bps": "7000", "target_exposure_units": "520"}, sid=SID)
         args.update(kw)
         with pytest.raises(ServiceError) as e:
-            check(sign("edit_hedge_settings", {"hedge_ratio_bps": 7000, "target_exposure_units": "520"}), **args)
+            check(sign("edit_hedge_settings", {"hedge_ratio_bps": "7000", "target_exposure_units": "520"}), **args)
         assert e.value.code == "AUTHORIZATION_INVALID", kw
 
 
@@ -202,12 +204,14 @@ def test_old_nonces_are_pruned():
     {"target_exposure_units": 520},  # even a whole JSON number
     {"amount_usd": 12.5},
     {"amount_usd": 0},
-    {"hedge_ratio_bps": 7000.0},  # a float where an integer belongs
-    {"hedge_ratio_bps": "7000"},  # a string where an integer belongs
+    {"hedge_ratio_bps": 6000},  # a whole JSON number is rejected too: it must be the string "6000"
+    {"hedge_ratio_bps": 0},
+    {"hedge_ratio_bps": 7000.0},
     {"hedge_ratio_bps": True},
     {"hedge_ratio_bps": -1},
+    {"hedge_ratio_bps": None},
 ])
-def test_json_numbers_are_rejected_where_decimal_strings_belong(params):
+def test_json_numbers_are_rejected_everywhere_in_signed_params(params):
     a = sign("edit_hedge_settings", {"target_exposure_units": "1"})  # the signature itself is fine; the params are not
     with pytest.raises(ServiceError) as e:
         auth.verify(a, "edit_hedge_settings", SID, params, now_ms=T0)
@@ -217,7 +221,10 @@ def test_json_numbers_are_rejected_where_decimal_strings_belong(params):
 def test_the_rejection_says_what_to_send_instead():
     with pytest.raises(ServiceError) as e:
         auth.verify(sign(), "rebalance", SID, {"amount_usd": 12.5}, now_ms=T0)
-    assert 'decimal string such as "520.5"' in e.value.message and "not a JSON number" in e.value.message and "params.amount_usd" in e.value.message
+    assert 'string such as "520.5"' in e.value.message and "not a JSON number" in e.value.message and "params.amount_usd" in e.value.message
+    with pytest.raises(ServiceError) as e:
+        auth.verify(sign(), "rebalance", SID, {"hedge_ratio_bps": 6000}, now_ms=T0)
+    assert 'string such as "6000"' in e.value.message and "params.hedge_ratio_bps" in e.value.message
 
 
 @pytest.mark.parametrize("good", ["0", "1", "520", "520.5", "0.000001", "1250.75", "123456789.123456789012345678"])
@@ -234,9 +241,21 @@ def test_malformed_decimal_strings_are_rejected(bad):
     assert e.value.code == "AUTHORIZATION_INVALID"
 
 
+@pytest.mark.parametrize("good", ["0", "1", "6000", "10000", "999999999999999"])
+def test_whole_number_strings_are_accepted_for_basis_points(good):
+    auth.validate_params({"hedge_ratio_bps": good})
+
+
+@pytest.mark.parametrize("bad", ["", " 6000", "6000 ", "06000", "-1", "+1", "6000.0", "6000.", "6e3", "0x10", "6,000", "1000000000000000", None, [], {}])
+def test_malformed_whole_number_strings_are_rejected(bad):
+    with pytest.raises(ServiceError) as e:
+        auth.validate_params({"hedge_ratio_bps": bad})
+    assert e.value.code == "AUTHORIZATION_INVALID"
+
+
 def test_other_param_types_and_unknown_fields():
-    auth.validate_params({"destination_wallet_address": "abc", "owner_pubkey": "x", "owner_multisig": "y", "hedge_ratio_bps": 0})
-    for bad in ({"destination_wallet_address": 5}, {"owner_pubkey": None}, {"surprise": "x"}):
+    auth.validate_params({"destination_wallet_address": "abc", "owner_pubkey": "x", "owner_multisig": "y", "hedge_ratio_bps": "0"})
+    for bad in ({"destination_wallet_address": 5}, {"owner_pubkey": None}, {"owner_pubkey": True}, {"surprise": "x"}):
         with pytest.raises(ServiceError):
             auth.validate_params(bad)
 

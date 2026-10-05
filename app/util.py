@@ -4,7 +4,9 @@ from decimal import Decimal
 
 def num(d: Decimal | None) -> float | None:
     """v4: money and quantities are plain JSON numbers."""
-    return None if d is None else float(d)
+    if d is None:
+        return None
+    return float(Decimal(d).quantize(Decimal("1e-8")))  # 8 decimals: no Decimal-to-float noise like -0.78560000000004
 
 
 def iso(dt: datetime | None) -> str | None:
