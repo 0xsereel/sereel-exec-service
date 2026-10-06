@@ -184,7 +184,8 @@ Postgres-ready (`pip install -e ".[postgres]"`, `DATABASE_URL=postgresql+psycopg
 A strategy is a delta-neutral hedge: the service shorts `target_exposure_units x hedge_ratio` of the market on the
 venue against a fund's exposure. Funding is by **intent**; the client never submits a signature.
 
-1. `POST /strategies` registers the strategy and its intent: status `pending_funding`, with `intent_id`,
+1. `POST /strategies` registers the strategy and its intent (`POST /strategies/intents` is accepted as an alias, the name the
+   pre-v4 plan used; without it that path reads as "strategy id = intents" and answers 405): status `pending_funding`, with `intent_id`,
    `funding_address` and `expires_at`. It is rejected (400) if `expected_amount_usd` is more than 2% below the required
    margin, which the service computes itself: `short size x price / leverage x (1 + MARGIN_BUFFER_PCT)`.
 2. The client sends a stablecoin transfer to the (single, global) funding address with an SPL **Memo that is exactly the

@@ -32,7 +32,10 @@ def funding_address():
 
 
 @router.post("")
+@router.post("/intents", include_in_schema=False)  # alias: the pre-v4 plan called creating a strategy "registering an intent"
 def create(body: service.CreateStrategyIn, user: str = USER, org: str = ORG):
+    """Register a strategy and its funding intent. Canonical path: POST /strategies (Cantina v4). `POST /strategies/intents` is an
+    accepted alias with the identical body and response; without it that path read as "strategy id = intents" and answered 405."""
     return service.strategy_out(service.create_strategy(body, user, org))
 
 
