@@ -6,3 +6,4 @@
   pyth_feed_id: "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"   # Metal.XAU/USD
   max_leverage: 3
   max_staleness_s: 30        # per-market Pyth staleness threshold
+  enabled: true              # false => listed as status "coming_soon" and strategies on it are refused

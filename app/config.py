@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     attest_keypair: str = "./keys/attest.json"
     payment_source_keypair: str = "./keys/payment_source.json"
 
+    hl_connect_timeout_s: float = 60  # while connecting only: the one-off metadata downloads are large and Hyperliquid can be slow
+    hl_connect_attempts: int = 4  # a failed connect step is retried (with a growing pause) before giving up
+    hl_request_timeout_s: float = 15  # every Hyperliquid call: the SDK default is NO timeout, so a silent peer blocks a thread forever
     hl_api_url: str = "https://api.hyperliquid-testnet.xyz"
     hl_account_address: str = ""
     hl_api_wallet_key: str = ""
@@ -26,18 +29,29 @@ class Settings(BaseSettings):
     hl_mm_api_wallet_key: str = ""
 
     venue: str = "hyperliquid"
-    pyth_hermes_url: str = "https://hermes.pyth.network"
+    pyth_hermes_url: str = "https://pyth.dourolabs.app/hermes"
     pyth_api_key: str = ""
     pyth_mock_price: Decimal | None = None  # dev/tests only: fixed price for every feed
     max_leverage: int = 3
     margin_buffer_pct: Decimal = Decimal(20)
+    min_order_usd: Decimal = Decimal(10)  # Hyperliquid rejects any order under $10 notional
     rebalance_band_pct: Decimal = Decimal(5)
     max_price_deviation_bps: Decimal = Decimal(200)
     ioc_max_retries: int = 3
+    activation_grace_s: int = 120  # how long after funding completes a deploy that cannot proceed is retried before it fails and refunds
+    rebalance_tolerance_pct: Decimal = Decimal(2)  # create: expected_amount_usd may be this far below the computed requirement
+    mm_min_size: Decimal = Decimal("0.02")  # market maker per-level order size bounds (coin units)
+    mm_max_size: Decimal = Decimal("0.05")
     intent_ttl_seconds: int = 3600
     intent_ttl_multisig_seconds: int = 7 * 24 * 3600
 
     allow_mainnet: bool = False
+    dev_auth_bypass: bool = False  # DEV ONLY: skip signed-message authorization. Refused when ALLOW_MAINNET=true.
+    auth_max_age_s: int = 60  # a signed message older than this is rejected
+    auth_future_skew_s: int = 30  # ... and one dated further ahead than this
+    squads_cache_s: int = 60  # how long a multisig's member list is cached
+    squads_program_id: str = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"
+    migrate_on_start: bool = True  # run `alembic upgrade head` when the API starts; set false in production
     api_key: str = ""
     cors_origins: str = ""
     database_url: str = "sqlite:///./service.db"
@@ -64,6 +78,15 @@ class Settings(BaseSettings):
         if not self.is_hl_testnet:
             raise RuntimeError("HL_API_URL is not testnet; set ALLOW_MAINNET=true to override")
 
+    @property
+    def auth_bypass_active(self) -> bool:
+        """The bypass only ever works off mainnet, even if the flag is set."""
+        return self.dev_auth_bypass and not self.allow_mainnet
+
+    def assert_auth_config_safe(self) -> None:
+        if self.dev_auth_bypass and self.allow_mainnet:
+            raise RuntimeError("DEV_AUTH_BYPASS=true is not allowed together with ALLOW_MAINNET=true")
+
     def resolve(self, p: str) -> Path:
         path = Path(p)
         return path if path.is_absolute() else ROOT / path
@@ -78,6 +101,13 @@ class Market(BaseModel):
     pyth_feed_id: str
     max_leverage: int = 3
     max_staleness_s: int = 30
+    enabled: bool = True  # false lists the market as "coming_soon" and refuses new strategies on it
+
+    @property
+    def status(self) -> str:
+        """The frontend's StrategyMarket.status: exactly "active" or "coming_soon" (a strict string comparison on its side).
+        It comes from configuration only, never from live prices: a slow Pyth or Hyperliquid must not grey a market out."""
+        return "active" if self.enabled else "coming_soon"
 
 
 def load_markets(path: Path | None = None) -> dict[str, Market]:

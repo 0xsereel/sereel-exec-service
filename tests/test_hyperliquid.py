@@ -1,0 +1,290 @@
+"""HyperliquidVenue logic against fake SDK objects (no network)."""
+from decimal import Decimal
+
+import pytest
+
+from app.config import load_markets
+from app.errors import ServiceError
+from app.venue.hyperliquid import HyperliquidVenue
+
+D = Decimal
+M = "XAU-HL"
+
+
+class FakeInfo:
+    def __init__(self):
+        self.dex_value = "100.0"
+        self.main_withdrawable = "500.0"
+        self.spot = "300.0"
+        self.leverage = {"type": "cross", "value": 20}
+
+    def user_state(self, addr, dex=""):
+        if dex == "":
+            return {"withdrawable": self.main_withdrawable, "marginSummary": {"accountValue": "500", "totalMarginUsed": "0"},
+                    "assetPositions": []}
+        return {"marginSummary": {"accountValue": self.dex_value, "totalMarginUsed": "10"}, "assetPositions": [
+            {"position": {"coin": "xyz:GOLD", "szi": "-0.6", "entryPx": "2650.0", "unrealizedPnl": "5.5", "liquidationPx": "3900"}}]}
+
+    def post(self, path, body):
+        if body["type"] == "l2Book":
+            return {"levels": [[{"px": "2650", "sz": "0.3"}, {"px": "2640", "sz": "0.2"}, {"px": "2600", "sz": "9"}],
+                               [{"px": "2655", "sz": "0.1"}, {"px": "2660", "sz": "0.4"}, {"px": "2700", "sz": "9"}]]}
+        if body["type"] == "userAbstraction":
+            return "default"
+        if body["type"] == "activeAssetData":
+            return {"leverage": dict(self.leverage) if self.leverage else {}}
+        return {"universe": [{"name": "xyz:GOLD"}]}, [{"markPx": "2651.5", "oraclePx": "2640.0"}]
+
+    def spot_user_state(self, addr):
+        return {"balances": [{"coin": "USDC", "total": self.spot, "hold": "0.0"}]}
+
+    def spot_meta(self):
+        return {"tokens": [{"name": "USDC", "tokenId": "0xabc"}]}
+
+    def user_fills(self, addr):
+        return [{"oid": 1, "fee": "0.4"}, {"oid": 1, "fee": "0.1"}, {"oid": 2, "fee": "9"}]
+
+    def user_funding_history(self, addr, since):
+        return [{"time": 1000, "delta": {"coin": "xyz:GOLD", "usdc": "-0.25"}}, {"time": 2000, "delta": {"coin": "xyz:GOLD", "usdc": "0.05"}},
+                {"time": 3000, "delta": {"coin": "BTC", "usdc": "99"}}]
+
+
+class FakeExchange:
+    def __init__(self, status):
+        self.status, self.calls, self.cancelled, self.sent = status, [], [], []
+
+    def order(self, coin, is_buy, sz, px, otype, reduce_only=False):
+        self.calls.append((coin, is_buy, sz, px, otype, reduce_only))
+        return {"status": "ok", "response": {"data": {"statuses": [self.status]}}}
+
+    def update_leverage(self, leverage, coin, is_cross=True):
+        self.lev_calls = getattr(self, "lev_calls", []) + [(leverage, coin, is_cross)]
+        if self.lev_reject_isolated and not is_cross:
+            return {"status": "err", "response": "isolated margin not supported"}
+        if self.lev_noop:
+            return {"status": "ok"}  # accepted but the venue does not actually change (simulates a mismatch)
+        self.info.leverage = {"type": "cross" if is_cross else "isolated", "value": leverage}
+        return {"status": "ok"}
+
+    lev_reject_isolated = False
+    lev_noop = False
+
+    def cancel(self, coin, oid):
+        self.cancelled.append(oid)
+
+    def withdraw_from_bridge(self, amount, destination):
+        self.withdrawn = (amount, destination)
+        return self.withdraw_result
+
+    withdraw_result = {"status": "ok", "response": {"type": "default"}}
+
+    def send_asset(self, dest, src, dst, token, amount):
+        self.sent.append((dest, src, dst, token, amount))
+        return {"status": "ok"}
+
+
+def venue(status=None, master=True):
+    v = HyperliquidVenue.__new__(HyperliquidVenue)
+    v.markets, v.master, v.account_key = load_markets(), "0xme", "0xme"
+    v.info, v._sz_dec, v.asset_ids = FakeInfo(), {M: 4}, {M: 750003}
+    v.mode = "default"
+    v._max_lev = {M: 25}
+    v.exchange = FakeExchange(status or {"filled": {"avgPx": "2650", "oid": 7, "totalSz": "0.1"}})
+    v._master_exchange = FakeExchange({}) if master else None
+    v.exchange.info = v.info
+    return v
+
+
+def test_price_rounding_five_sig_figs_and_decimal_cap():
+    r = HyperliquidVenue._round_px
+    assert r(D("2663.2517"), 4) == 2663.3  # 5 sig figs, and <= 6-4 = 2 decimals
+    assert r(D("12.345678"), 2) == 12.346
+
+
+def test_position_and_mark_parsing():
+    p = venue().position(None, M)
+    assert (p.size, p.entry_px, p.unrealized_pnl, p.liquidation_px, p.mark, p.account_value) == \
+           (D("-0.6"), D(2650), D("5.5"), D(3900), D("2651.5"), D(100))
+
+
+def test_funding_sums_only_this_coin_and_entries_carry_their_time():
+    v = venue()
+    assert v.funding_since(M, 0) == D("-0.20")
+    assert v.funding_entries(M, 0) == [(1000, D("-0.25")), (2000, D("0.05"))]
+    assert v.funding_entries(M, 1000) == [(2000, D("0.05"))]  # strictly after the cursor: nothing is counted twice
+
+
+def test_fees_use_actual_fills_for_the_orders_only():
+    assert venue()._fees_for(M, ["1"], D(1000)) == D("0.5")
+
+
+def test_ioc_filled_sends_ioc_with_rounded_price():
+    v = venue()
+    assert v._ioc(M, False, D("0.6"), D("2637.2518")) == (D(2650), "7")
+    coin, is_buy, sz, px, otype, reduce_only = v.exchange.calls[0]
+    assert (coin, is_buy, sz, px, otype, reduce_only) == ("xyz:GOLD", False, 0.6, 2637.3, {"limit": {"tif": "Ioc"}}, False)
+
+
+def test_ioc_no_cross_is_zero_fill_not_error():
+    v = venue({"error": "Order could not immediately match against any resting orders. asset=750003"})
+    assert v._ioc(M, False, D(1), D(2600)) == (None, None)
+
+
+def test_ioc_resting_is_cancelled():
+    v = venue({"resting": {"oid": 9}})
+    assert v._ioc(M, False, D(1), D(2600)) == (None, "9") and v.exchange.cancelled == [9]
+
+
+def test_ioc_margin_error_maps_to_insufficient_margin():
+    with pytest.raises(ServiceError) as e:
+        venue({"error": "Insufficient margin to place order."})._ioc(M, False, D(1), D(2600))
+    assert e.value.code == "INSUFFICIENT_MARGIN"
+
+
+def test_ioc_other_error_is_order_not_filled():
+    with pytest.raises(ServiceError) as e:
+        venue({"error": "Price must be divisible by tick size."})._ioc(M, False, D(1), D(2600))
+    assert e.value.code == "ORDER_NOT_FILLED"
+
+
+def test_ensure_margin_tops_up_only_the_shortfall_via_master():
+    v = venue()
+    v.ensure_margin(M, D(160))  # dex holds 100 -> move 60 from main perp to xyz
+    assert v._master_exchange.sent == [("0xme", "", "xyz", "USDC:0xabc", 60.0)] and not v.exchange.sent
+    v._master_exchange.sent.clear()
+    v.ensure_margin(M, D(80))
+    assert v._master_exchange.sent == []  # already covered
+
+
+def test_ensure_margin_draws_main_then_spot():
+    v = venue()
+    v.info.main_withdrawable = "20.0"
+    v.ensure_margin(M, D(160))  # needs 60: 20 from main perp, 40 from spot
+    assert v._master_exchange.sent == [("0xme", "", "xyz", "USDC:0xabc", 20.0), ("0xme", "spot", "xyz", "USDC:0xabc", 40.0)]
+
+
+def test_ensure_margin_spot_only_like_the_real_account():
+    v = venue()
+    v.info.main_withdrawable = "0.0"
+    v.ensure_margin(M, D(160))
+    assert v._master_exchange.sent == [("0xme", "spot", "xyz", "USDC:0xabc", 60.0)]
+
+
+def test_ensure_margin_errors():
+    with pytest.raises(ServiceError) as e:
+        venue().ensure_margin(M, D(1000))  # needs 900, main 500 + spot 300
+    assert e.value.code == "INSUFFICIENT_MARGIN" and "spot USDC is 300" in e.value.message
+    with pytest.raises(ServiceError) as e:
+        venue(master=False).ensure_margin(M, D(160))
+    assert e.value.code == "INSUFFICIENT_MARGIN" and "master key" in e.value.message
+
+
+def test_release_margin_moves_dex_back_to_main():
+    v = venue()
+    v.release_margin(M, D(25))
+    assert v._master_exchange.sent == [("0xme", "xyz", "", "USDC:0xabc", 25.0)]
+
+
+def test_oracle_price():
+    assert venue().oracle_price(M) == D("2640.0")
+
+
+@pytest.mark.parametrize("mode", ["unifiedAccount", "portfolioMargin"])
+def test_unified_accounts_skip_dex_transfers(mode):
+    v = venue()
+    v.mode = mode
+    v.ensure_margin(M, D(160))  # spot USDC 300 covers it; collateral is shared, so nothing moves
+    v.release_margin(M, D(25))
+    assert v._master_exchange.sent == []
+
+
+def test_unified_account_still_checks_it_holds_enough():
+    v = venue()
+    v.mode = "unifiedAccount"
+    with pytest.raises(ServiceError) as e:
+        v.ensure_margin(M, D(1000))
+    assert e.value.code == "INSUFFICIENT_MARGIN"
+
+
+def test_account_mode_detection():
+    from app.venue.hyperliquid import account_mode, is_unified
+
+    class I:
+        def __init__(self, r): self.r = r
+        def post(self, path, body):
+            assert body == {"type": "userAbstraction", "user": "0xa"}
+            return self.r
+
+    assert account_mode(I("unifiedAccount"), "0xa") == "unifiedAccount"
+    assert is_unified("unifiedAccount") and is_unified("portfolioMargin")
+    assert not is_unified("default") and not is_unified("dexAbstraction") and not is_unified("disabled")
+
+
+def test_withdraw_signs_with_master_to_own_address_by_default():
+    v = venue()
+    assert v.withdraw_to_arbitrum(D(10))["status"] == "ok"
+    assert v._master_exchange.withdrawn == (10.0, "0xme") and not hasattr(v.exchange, "withdrawn")  # never the agent
+
+
+def test_withdraw_explicit_destination_and_limits():
+    v = venue()
+    v.withdraw_to_arbitrum(D(5), "0xother")
+    assert v._master_exchange.withdrawn == (5.0, "0xother")
+    with pytest.raises(ServiceError) as e:
+        v.withdraw_to_arbitrum(D(501))  # main perp withdrawable is 500
+    assert e.value.code == "WITHDRAW_BELOW_MARGIN"
+
+
+def test_withdraw_needs_master_key_and_surfaces_rejection():
+    with pytest.raises(ServiceError) as e:
+        venue(master=False).withdraw_to_arbitrum(D(10))
+    assert e.value.code == "WITHDRAW_NOT_AUTHORIZED"
+    v = venue()
+    v._master_exchange.withdraw_result = {"status": "err", "response": "Insufficient balance"}
+    with pytest.raises(ServiceError) as e:
+        v.withdraw_to_arbitrum(D(10))
+    assert e.value.code == "WITHDRAW_FAILED" and "Insufficient" in e.value.message
+
+
+def test_leverage_is_set_isolated_first_and_verified_by_reading_back():
+    v = venue()
+    assert v.leverage_status(M) == {"leverage": 20, "mode": "cross"}
+    got = v.ensure_leverage(M)
+    assert got == {"leverage": 3, "mode": "isolated"} and v.exchange.lev_calls == [(3, "xyz:GOLD", False)]
+
+
+def test_leverage_falls_back_to_cross_when_isolated_is_rejected():
+    v = venue()
+    v.exchange.lev_reject_isolated = True
+    assert v.ensure_leverage(M) == {"leverage": 3, "mode": "cross"}
+    assert [c[2] for c in v.exchange.lev_calls] == [False, True]
+
+
+def test_leverage_already_correct_sends_nothing():
+    v = venue()
+    v.info.leverage = {"type": "isolated", "value": 3}
+    v.ensure_leverage(M)
+    assert not hasattr(v.exchange, "lev_calls")
+
+
+def test_unconfirmed_leverage_blocks_trading_with_its_own_code():
+    v = venue()
+    v.exchange.lev_noop = True  # venue says ok but leverage stays 20x
+    with pytest.raises(ServiceError) as e:
+        v.ensure_leverage(M)
+    assert e.value.code == "LEVERAGE_NOT_SET" and e.value.code != "INSUFFICIENT_MARGIN"
+    with pytest.raises(ServiceError):
+        v.prepare_market(M)
+    assert v.exchange.calls == []  # no order was sent
+
+
+def test_maintenance_rate_is_one_over_twice_max_leverage():
+    assert venue().maintenance_rate(M) == D("0.02")
+
+
+def test_available_liquidity_counts_only_the_levels_the_order_could_reach():
+    v = venue()
+    assert v.available_liquidity(M, True, D("2660")) == D("0.5")  # asks at 2655 and 2660; 2700 is beyond the limit
+    assert v.available_liquidity(M, True, D("2654")) == 0  # nothing offered that low
+    assert v.available_liquidity(M, False, D("2640")) == D("0.5")  # bids at 2650 and 2640; 2600 is beyond the limit
+    assert v.available_liquidity(M, False, D("2651")) == 0

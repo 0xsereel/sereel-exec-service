@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
   "fastapi", "uvicorn[standard]", "hyperliquid-python-sdk", "eth-account",
   "solana", "solders", "httpx", "sqlmodel", "apscheduler", "typer", "rich",
-  "pyyaml", "python-dotenv", "pydantic-settings", "pynacl", "base58",
+  "pyyaml", "python-dotenv", "pydantic-settings", "pynacl", "base58", "alembic",
 ]
 
 [project.optional-dependencies]

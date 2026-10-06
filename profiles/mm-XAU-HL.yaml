@@ -1,0 +1,5 @@
+center: oracle
+levels: 3
+max_inventory: 0.15
+size: 0.05
+spread_bps: 10.0
