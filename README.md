@@ -65,6 +65,10 @@ authorization and strategy ownership". For local development without a signer, `
 mainnet only, logged on every request).
 
 **Troubleshooting**
+- `BAD_REQUEST` on create with "below the venue's $10 minimum order": Hyperliquid rejects any order under $10 notional, so a
+  strategy whose hedge (`target_exposure_units` x `hedge_ratio_bps`) is worth less is refused up front (`MIN_ORDER_USD`, with a
+  5% cushion for the mark moving). The message gives the smallest exposure that works. At the testnet gold price that is
+  roughly $3.5 of margin at 3x.
 - `NO_LIQUIDITY`: nothing is offering the size you need. Start the market maker (`sereel serve --mm`, or `sereel mm run`).
   On testnet the market maker is effectively the only liquidity; once it is stopped the book can be empty.
 - `STALE_PRICE` / `PRICE_SOURCE_AUTH`: Pyth is unreachable or rejected `PYTH_API_KEY`. A *closed* market is not an error (see

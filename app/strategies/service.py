@@ -139,7 +139,14 @@ def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> St
                                                   required=not settings.auth_bypass_active)
 
     size = body.target_exposure_units * Decimal(body.hedge_ratio_bps) / 10_000
-    required = required_margin(size, venue().mark_price(body.market_id), body.leverage)
+    mark = venue().mark_price(body.market_id)
+    notional, minimum = size * mark, settings.min_order_usd * Decimal("1.05")  # 5% cushion for the mark moving before the order
+    if 0 < size and notional < minimum:
+        need = (minimum / mark / (Decimal(body.hedge_ratio_bps) / 10_000)).quantize(Decimal("0.0001"), rounding="ROUND_UP")
+        raise _bad(f"the hedge would be {size} units (about ${notional:.2f}), below the venue's ${settings.min_order_usd} minimum order. "
+                   f"Raise target_exposure_units to at least {need} at hedge_ratio_bps {body.hedge_ratio_bps} "
+                   f"(about ${required_margin(need * Decimal(body.hedge_ratio_bps) / 10_000, mark, body.leverage):.2f} of margin)")
+    required = required_margin(size, mark, body.leverage)
     floor = required * (1 - settings.rebalance_tolerance_pct / 100)
     if body.expected_amount_usd < floor:
         raise _bad(f"expected_amount_usd {body.expected_amount_usd} is below the required margin {required} "

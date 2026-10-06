@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     pyth_mock_price: Decimal | None = None  # dev/tests only: fixed price for every feed
     max_leverage: int = 3
     margin_buffer_pct: Decimal = Decimal(20)
+    min_order_usd: Decimal = Decimal(10)  # Hyperliquid rejects any order under $10 notional
     rebalance_band_pct: Decimal = Decimal(5)
     max_price_deviation_bps: Decimal = Decimal(200)
     ioc_max_retries: int = 3
