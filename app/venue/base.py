@@ -84,6 +84,12 @@ class VenueAdapter(ABC):
         """Make sure the market's margin balance holds at least usd_amount, else raise INSUFFICIENT_MARGIN."""
 
     @abstractmethod
+    def add_margin(self, market_id: str, usd_amount: Decimal) -> None:
+        """Move EXACTLY usd_amount of cash onto the market's dex balance. This is how a credited deposit reaches the venue:
+        unlike ensure_margin it never reasons about what the dex already holds (its accountValue includes unrealized P&L, so a
+        top-up 'to a target' moves less than was credited and leaks the difference from the other strategies)."""
+
+    @abstractmethod
     def size_decimals(self, market_id: str) -> int: ...
 
     @abstractmethod

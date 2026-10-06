@@ -8,6 +8,8 @@ import logging
 import time
 from decimal import Decimal
 
+import requests
+
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -27,6 +29,53 @@ def account_mode(info: Info, address: str) -> str:
     return r if isinstance(r, str) else str(r)
 
 
+# ---- connecting ---------------------------------------------------------------------------------------------------------
+# The SDK's Exchange builds its OWN Info, which downloads the (large) spot and perp metadata again; three clients meant a dozen
+# downloads at startup, and with a slow Hyperliquid a flat request timeout then killed the service before it was up. So: ONE
+# shared Info does the downloading (long connect timeout, retried), every Exchange is built offline from placeholder metadata
+# and pointed at that Info, and afterwards every client drops to the short per-request timeout.
+_NO_META = {"universe": []}
+_NO_SPOT_META = {"universe": [], "tokens": []}
+_TRANSIENT = (requests.exceptions.RequestException, ConnectionError, TimeoutError)
+
+
+def connect_with_retries(what: str, fn):
+    """Run a network step of connecting; retry transient failures with a growing pause, then fail with a clear error."""
+    attempts = max(1, settings.hl_connect_attempts)
+    for n in range(1, attempts + 1):
+        try:
+            return fn()
+        except _TRANSIENT as e:
+            if n == attempts:
+                raise ServiceError("VENUE_UNAVAILABLE", f"Hyperliquid ({settings.hl_api_url}) did not answer while {what}, after {attempts} "
+                                   f"attempts: {type(e).__name__}. It may be slow or down; raise HL_CONNECT_TIMEOUT_S / HL_CONNECT_ATTEMPTS "
+                                   "or try again.", 503)
+            log.warning("Hyperliquid not answering while %s (attempt %d/%d, %s); retrying", what, n, attempts, type(e).__name__)
+            time.sleep(min(2 * n, 10))
+
+
+def shared_info(dexs: list[str] | None) -> Info:
+    """The one Info that downloads metadata. It keeps the long connect timeout until `use_request_timeouts` is called."""
+    return connect_with_retries("loading market metadata", lambda: Info(settings.hl_api_url, skip_ws=True, perp_dexs=dexs,
+                                                                       timeout=settings.hl_connect_timeout_s))
+
+
+def exchange_for(private_key: str, account_address: str, info: Info) -> Exchange:
+    """An Exchange that makes NO network calls to build: placeholder metadata, then `.info` is the shared Info (which is what
+    order, update_leverage and send_asset use to resolve asset ids and prices)."""
+    ex = Exchange(Account.from_key(private_key), settings.hl_api_url, meta=_NO_META, spot_meta=_NO_SPOT_META,
+                  account_address=account_address, timeout=settings.hl_connect_timeout_s)
+    ex.info = info
+    return ex
+
+
+def use_request_timeouts(*clients) -> None:
+    """Connected: every client now uses the short per-request timeout, so a silent peer can never hang a thread."""
+    for c in clients:
+        if c is not None:
+            c.timeout = settings.hl_request_timeout_s
+
+
 def is_unified(mode: str) -> bool:
     """Unified/portfolio accounts share collateral across spot and every perp dex: no dex transfers exist or are needed."""
     return mode in UNIFIED_MODES
@@ -42,17 +91,15 @@ class HyperliquidVenue(VenueAdapter):
         self.master = settings.hl_account_address
         self.account_key = self.master.lower()
         dexs = [""] + sorted({m.hl_dex for m in markets.values() if m.venue == "hyperliquid" and m.hl_dex})
-        self.info = Info(settings.hl_api_url, skip_ws=True, perp_dexs=dexs)
-        self.exchange = Exchange(Account.from_key(settings.hl_api_wallet_key), settings.hl_api_url,
-                                 account_address=self.master, perp_dexs=dexs)
-        self._master_exchange = (Exchange(Account.from_key(settings.hl_master_key), settings.hl_api_url,
-                                          account_address=self.master, perp_dexs=dexs)
-                                 if settings.hl_master_key else None)
+        self.info = shared_info(dexs)
+        self.exchange = exchange_for(settings.hl_api_wallet_key, self.master, self.info)
+        self._master_exchange = exchange_for(settings.hl_master_key, self.master, self.info) if settings.hl_master_key else None
         self.asset_ids: dict[str, int] = {}
         self._sz_dec: dict[str, int] = {}
         self._max_lev: dict[str, int] = {}
-        self.resolve_markets()
-        self.mode = account_mode(self.info, self.master)
+        connect_with_retries("resolving the markets", self.resolve_markets)
+        self.mode = connect_with_retries("reading the account mode", lambda: account_mode(self.info, self.master))
+        use_request_timeouts(self.info, self.exchange, self._master_exchange)
         log.info("master account abstraction: %s", self.mode)
         if is_unified(self.mode):
             log.warning("master is %s, expected 'default': dex margin transfers will be skipped and per-dex "
@@ -183,19 +230,13 @@ class HyperliquidVenue(VenueAdapter):
                 return Decimal(b["total"]) - Decimal(b.get("hold", "0"))
         return Decimal(0)
 
-    def ensure_margin(self, market_id, usd_amount):
-        """Top the builder-dex balance up to usd_amount, drawing on the main perp balance first, then spot USDC."""
-        m = self.market(market_id)
-        if not m.hl_dex:
-            return
+    def _move_to_dex(self, m, need: Decimal) -> None:
+        """Move `need` USDC to the builder dex, from the main perp balance first, then spot. Unified accounts share collateral,
+        so there is nothing to move; they only need to hold it."""
         if is_unified(self.mode):
             spot = self._spot_usdc()
-            if spot < Decimal(usd_amount):
-                raise ServiceError("INSUFFICIENT_MARGIN", f"unified account holds {spot} USDC, need {usd_amount}")
-            return  # collateral is shared; nothing to move
-        have = Decimal(self.info.user_state(self.master, dex=m.hl_dex)["marginSummary"]["accountValue"])
-        need = Decimal(usd_amount) - have
-        if need <= 0:
+            if spot < need:
+                raise ServiceError("INSUFFICIENT_MARGIN", f"unified account holds {spot} USDC, need {need}")
             return
         main = Decimal(self.info.user_state(self.master)["withdrawable"])
         spot = self._spot_usdc()
@@ -207,6 +248,23 @@ class HyperliquidVenue(VenueAdapter):
             self._transfer("", m.hl_dex, from_main)
         if need - from_main > 0:
             self._transfer("spot", m.hl_dex, need - from_main)
+
+    def add_margin(self, market_id, usd_amount):
+        m = self.market(market_id)
+        amount = Decimal(usd_amount)
+        if m.hl_dex and amount > 0:
+            self._move_to_dex(m, amount)
+
+    def ensure_margin(self, market_id, usd_amount):
+        """Top the builder-dex balance up to usd_amount (measured on accountValue). Kept for the VenueAdapter interface;
+        crediting a deposit uses add_margin, which moves exactly what was credited."""
+        m = self.market(market_id)
+        if not m.hl_dex:
+            return
+        have = Decimal(self.info.user_state(self.master, dex=m.hl_dex)["marginSummary"]["accountValue"])
+        need = Decimal(usd_amount) - have
+        if need > 0:
+            self._move_to_dex(m, need)
 
     def release_margin(self, market_id, usd_amount):
         m = self.market(market_id)

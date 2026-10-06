@@ -27,7 +27,7 @@ from ..errors import ServiceError
 from ..models import (S_ACTIVE, S_CLOSED, S_CLOSING, W_BRIDGING, W_COMPLETED, W_FAILED, W_POSITION_CLOSED, W_RELEASED,
                       W_REQUESTED, Action, Strategy, Withdrawal, now)
 from ..util import iso, num
-from ..venue.base import DEFAULT_SLIPPAGE, MirroredRoute, account_lock
+from ..venue.base import MirroredRoute, account_lock
 from . import attest as att
 from . import service as svc
 
@@ -117,17 +117,8 @@ def _inflight(sid: str) -> Withdrawal | None:
 
 
 def _require_liquidity(st: Strategy, v) -> None:
-    """Closing buys back a short (sells a long): fail clearly if the book cannot take it, instead of retrying into an
-    empty book."""
-    need, is_buy = abs(st.size), st.size < 0
-    mark = v.mark_price(st.market_id)
-    limit = mark * (1 + DEFAULT_SLIPPAGE if is_buy else 1 - DEFAULT_SLIPPAGE)
-    offered = v.available_liquidity(st.market_id, is_buy, limit)
-    if offered < need:
-        coin = svc.state.markets[st.market_id].hl_coin
-        raise ServiceError("NO_LIQUIDITY", f"the book offers {offered.normalize():f} {coin} to a {'buy' if is_buy else 'sell'} within "
-                           f"{DEFAULT_SLIPPAGE:.1%} of the mark {mark} (limit {limit:.2f}), but closing needs {need.normalize():f}. Nothing was "
-                           f"sent. Start the market maker (sereel mm run --market {st.market_id}) and retry.", 409)
+    """Closing buys back a short (sells a long): the shared NO_LIQUIDITY rule, for the position's whole size."""
+    svc.require_liquidity(st.market_id, st.size < 0, abs(st.size), "closing")
 
 
 def _equity(st: Strategy, mark: Decimal) -> tuple[Decimal, Decimal]:

@@ -14,6 +14,7 @@ M = "XAU-HL"
 
 def bare(cfg=None, **kw):
     mm = MarketMaker.__new__(MarketMaker)
+    kw.setdefault("flatten_wait_s", 0)  # these tests do not exercise the startup wait (test_mm_startup.py does)
     mm.market, mm.cfg, mm.sz_dec, mm.addr, mm.mode = load_markets()[M], cfg or MMConfig(M, **kw), 4, "0xmm", "unifiedAccount"
     mm._stop = False
     return mm
@@ -38,7 +39,7 @@ class FakeExchange:
 class FakeInfo:
     def __init__(self, inv="0", ctx=None, book=None):
         self.inv, self.ctx = D(inv), ctx or {"markPx": "4209.3", "oraclePx": "4160.4"}
-        self.book = book or {"levels": [[{"px": "4201.1"}], [{"px": "4222.1"}]]}
+        self.book = book or {"levels": [[{"px": "4201.1", "sz": "0.5"}], [{"px": "4222.1", "sz": "0.5"}]]}
         self.orders = [{"coin": "xyz:GOLD", "oid": 5}]
 
     def user_state(self, addr, dex=""):

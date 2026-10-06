@@ -22,7 +22,8 @@ from hyperliquid.info import Info
 from .. import pyth
 from ..config import ROOT, Market, settings
 from ..errors import ServiceError
-from ..venue.hyperliquid import account_mode, is_unified
+from ..venue.hyperliquid import (account_mode, connect_with_retries, exchange_for, is_unified, shared_info,
+                                  use_request_timeouts)
 
 log = logging.getLogger("sereel.mm")
 
@@ -38,6 +39,7 @@ class MMConfig:
     size: Decimal = Decimal("0.03")  # coin units per level, bounded by MM_MIN_SIZE..MM_MAX_SIZE
     refresh_s: float = 5
     center: str = "oracle"  # oracle | pyth | mark
+    flatten_wait_s: float = 60  # on startup: how long to wait for the book to let leftover inventory be flattened
     max_inventory: Decimal | None = None  # coin units; default levels * size
     skew_bps: Decimal | None = None  # center shift at max inventory; default levels * spread_bps
 
@@ -86,12 +88,12 @@ class MarketMaker:
         self.market, self.cfg = market, cfg
         self.addr = settings.hl_mm_account_address
         dexs = ["", market.hl_dex] if market.hl_dex else None
-        self.info = Info(settings.hl_api_url, skip_ws=True, perp_dexs=dexs)
-        self.exchange = Exchange(Account.from_key(settings.hl_mm_api_wallet_key), settings.hl_api_url,
-                                 account_address=self.addr, perp_dexs=dexs)
-        meta = self.info.meta(dex=market.hl_dex)
+        self.info = shared_info(dexs)  # one metadata download, long connect timeout, retried (see app/venue/hyperliquid.py)
+        self.exchange = exchange_for(settings.hl_mm_api_wallet_key, self.addr, self.info)
+        meta = connect_with_retries("loading the market", lambda: self.info.meta(dex=market.hl_dex))
         self.sz_dec = next(int(u["szDecimals"]) for u in meta["universe"] if u["name"] == market.hl_coin)
-        self.mode = account_mode(self.info, self.addr)
+        self.mode = connect_with_retries("reading the account mode", lambda: account_mode(self.info, self.addr))
+        use_request_timeouts(self.info, self.exchange)
         self._stop = False
 
     # -- market data ----------------------------------------------------------
@@ -111,6 +113,14 @@ class MarketMaker:
     def best_bid_ask(self) -> tuple[Decimal | None, Decimal | None]:
         bids, asks = self.info.post("/info", {"type": "l2Book", "coin": self.market.hl_coin})["levels"]
         return (Decimal(bids[0]["px"]) if bids else None, Decimal(asks[0]["px"]) if asks else None)
+
+    def book_offers(self, is_buy: bool, limit: Decimal) -> Decimal:
+        """Size the book offers to an order on this side up to `limit`: asks at or below it when buying, bids at or above it
+        when selling (the market maker's own quotes are cancelled before this is asked)."""
+        bids, asks = self.info.post("/info", {"type": "l2Book", "coin": self.market.hl_coin})["levels"]
+        if is_buy:
+            return sum((Decimal(l["sz"]) for l in asks if Decimal(l["px"]) <= limit), Decimal(0))
+        return sum((Decimal(l["sz"]) for l in bids if Decimal(l["px"]) >= limit), Decimal(0))
 
     def margin(self) -> Decimal:
         return Decimal(self.info.user_state(self.addr, dex=self.market.hl_dex)["marginSummary"]["accountValue"])
@@ -186,8 +196,41 @@ class MarketMaker:
             log.warning("could not fully flatten: residual %s", residual)
         return residual
 
+    def flatten_on_start(self) -> Decimal:
+        """Inventory left over from a previous run is flattened (reduce-only) BEFORE quoting normally, as soon as the book has
+        anything to take it. Waits up to flatten_wait_s; if the book never allows it, quoting starts anyway (skewed against
+        the inventory) and the residual is returned. Returns the signed inventory still held."""
+        q = Decimal(1).scaleb(-self.sz_dec)
+        inv = self.inventory()
+        if abs(inv) < q:
+            return Decimal(0)
+        self.cancel_all()  # a previous run's resting quotes would otherwise trade against our own flatten order
+        log.warning("leftover inventory %s: flattening it (reduce-only) before quoting; waiting up to %ss for the book", inv,
+                    self.cfg.flatten_wait_s)
+        deadline = time.time() + self.cfg.flatten_wait_s
+        while not self._stop:
+            inv = self.inventory()
+            if abs(inv) < q:
+                log.info("startup inventory flattened")
+                return Decimal(0)
+            is_buy = inv < 0  # short -> buy back
+            limit = self.mark() * (Decimal("1.01") if is_buy else Decimal("0.99"))
+            if self.book_offers(is_buy, limit) > 0:  # the book allows (some of) it: send a reduce-only IOC
+                self.flatten(attempts=1)
+                if abs(self.inventory()) < q:
+                    continue  # flat: the top of the loop reports it, no need to wait another tick
+            if time.time() >= deadline:
+                break
+            self._sleep(self.cfg.refresh_s)
+        inv = self.inventory()
+        if abs(inv) >= q:
+            log.warning("the book does not allow flattening %s yet: quoting normally, skewed against the inventory", inv)
+        return inv
+
     # -- lifecycle ------------------------------------------------------------
-    def run(self) -> None:
+    def run(self, manage_pid: bool = True) -> None:
+        """Quote until stopped. manage_pid=False when embedded in `sereel serve`: the pidfile would hold the SERVER's pid, and
+        `sereel mm stop` would then kill the server instead of just the maker."""
         log.warning("\n%s", BANNER)
         log.info("account abstraction: %s%s", self.mode,
                  " (unified: collateral is shared, no dex transfers needed)" if is_unified(self.mode) else
@@ -198,9 +241,11 @@ class MarketMaker:
                  self.market.hl_coin, self.cfg.center, self.cfg.levels, self.cfg.spread_bps, self.cfg.size,
                  self.cfg.max_inventory, self.cfg.skew_bps, self.cfg.refresh_s)
         p = pidfile(self.cfg.market_id)
-        p.parent.mkdir(exist_ok=True)
-        p.write_text(str(os.getpid()))
+        if manage_pid:
+            p.parent.mkdir(exist_ok=True)
+            p.write_text(str(os.getpid()))
         try:
+            self.flatten_on_start()
             while not self._stop:
                 try:
                     self.tick()
@@ -210,7 +255,8 @@ class MarketMaker:
         except KeyboardInterrupt:
             log.warning("interrupted")
         finally:
-            p.unlink(missing_ok=True)
+            if manage_pid:
+                p.unlink(missing_ok=True)
             self.shutdown()
 
     def _sleep(self, seconds: float) -> None:

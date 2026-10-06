@@ -29,6 +29,18 @@ def fresh_db():
     yield
 
 
+from app.strategies import watcher as _watcher  # noqa: E402
+
+_REAL_ENSURE_CURSOR = _watcher.ensure_cursor
+
+
+@pytest.fixture(autouse=True)
+def no_devnet_at_startup(monkeypatch):
+    """The API's startup takes the deposit watcher's baseline from devnet. Tests must never touch devnet, so it is a no-op unless
+    a test uses the fake chain (which supplies a fake RPC and switches the real baseline back on)."""
+    monkeypatch.setattr(_watcher, "ensure_cursor", lambda: None)
+
+
 class FakeChain:
     """An in-memory Solana: inbound transfers to the funding address, finalized signature listing, refunds, memos."""
 
@@ -55,6 +67,7 @@ class FakeChain:
         self.payouts: list[tuple] = []
         self.fetch_errors: set[str] = set()
         self.n = 0
+        monkeypatch.setattr(_watcher, "ensure_cursor", _REAL_ENSURE_CURSOR)  # the fake RPC below answers it
         monkeypatch.setattr(sol, "rpc", self._rpc)
         monkeypatch.setattr(sol, "finalized_signatures_since", self._since)
         monkeypatch.setattr(sol, "get_parsed_tx", self._get_tx)

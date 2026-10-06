@@ -22,7 +22,7 @@ from ..models import (D_CANCELLED, D_CONFIRMED, D_EXPIRED, D_PENDING, S_ACTIVE, 
                       S_PENDING, S_REBALANCING, Action, PnlSnapshot, Strategy, StrategyDeposit, now)
 from ..state import state
 from ..util import iso, num
-from ..venue.base import account_lock
+from ..venue.base import DEFAULT_SLIPPAGE, account_lock
 from . import attest as att
 
 log = logging.getLogger("sereel.strategies")
@@ -288,6 +288,21 @@ def operator_set_owner(sid: str, owner_pubkey: str | None, owner_multisig: str |
         return st
 
 
+def require_liquidity(market_id: str, is_buy: bool, need: Decimal, what: str) -> None:
+    """Before ANY order: the book must offer `need` on the side we would take, within the IOC's slippage band of the mark.
+    Otherwise NO_LIQUIDITY and nothing is sent, instead of firing IOCs into an empty book. One rule for close, deploy and
+    rebalance."""
+    v = venue()
+    mark = v.mark_price(market_id)
+    limit = mark * (1 + DEFAULT_SLIPPAGE if is_buy else 1 - DEFAULT_SLIPPAGE)
+    offered = v.available_liquidity(market_id, is_buy, limit)
+    if offered < need:
+        coin = state.markets[market_id].hl_coin
+        raise ServiceError("NO_LIQUIDITY", f"the book offers {offered.normalize():f} {coin} to a {'buy' if is_buy else 'sell'} within "
+                           f"{DEFAULT_SLIPPAGE:.1%} of the mark {mark} (limit {limit:.2f}), but {what} needs {need.normalize():f}. "
+                           f"Nothing was sent. Start the market maker (sereel mm run --market {market_id}) and retry.", 409)
+
+
 # ---- ledger helpers ---------------------------------------------------------
 
 def sum_margins(s: Session, exclude: str | None = None) -> Decimal:
@@ -320,21 +335,46 @@ def ledger_cash(s: Session) -> Decimal:
                 if r.status != S_CLOSING or r.margin_usd > 0), Decimal(0))
 
 
-RECONCILE_TOLERANCE = Decimal("0.05")  # rounding and fee timing only; fees themselves are accounted for above
+RECONCILE_TOLERANCE = Decimal("0.05")  # rounding only: fees, realized P&L and unrealized P&L are all accounted for exactly
+
+
+def ledger_equity(s: Session, marks: dict[str, Decimal]) -> tuple[Decimal, Decimal]:
+    """(cash, equity) the strategies are entitled to: credited margin + realized P&L + funding - fees, plus unrealized P&L at
+    the venue's mark. A closing strategy whose margin was already released holds nothing on the venue any more."""
+    cash = equity = Decimal(0)
+    for r in s.exec(select(Strategy).where(Strategy.status.in_(LIVE))).all():
+        if r.status == S_CLOSING and r.margin_usd <= 0:
+            continue
+        c = r.margin_usd + r.realized_pnl_usd + r.funding_usd - r.fees_usd
+        cash += c
+        equity += c + ((marks[r.market_id] - r.entry_px) * r.size if r.size else Decimal(0))
+    return cash, equity
 
 
 def reconcile() -> dict:
-    """The strategies' ledger cash must not exceed the cash on the venue's dex balance."""
-    with Session(engine) as s:
-        margins, ledger = sum_margins(s), ledger_cash(s)
+    """The venue's equity (accountValue) must equal what the strategies are entitled to, to within rounding.
+
+    This compares EQUITY, not cash. Hyperliquid realizes a close against the blended account entry while the ledger realizes
+    it against each strategy's own entry, so the two cash figures legitimately differ by an amount that reappears in
+    unrealized P&L; in equity terms it cancels exactly, so a real shortfall cannot hide behind it (it once did)."""
+    v = venue()
     first = next(iter(state.markets))
-    pos = venue().position(None, first)
-    cash = pos.account_value - pos.unrealized_pnl
-    ok = ledger <= cash + RECONCILE_TOLERANCE
+    pos = v.position(None, first)  # ONE snapshot: accountValue, unrealized P&L and entry come from the same instant
+    with Session(engine) as s:
+        used = set(s.exec(select(Strategy.market_id).where(Strategy.status.in_(LIVE))).all())
+        # Mark the ledger at the price IMPLIED by that snapshot (entry + unrealized / size), not at a separate mark read: two
+        # reads seconds apart differ by (position size x the price move between them), which is noise that looks like drift.
+        implied = pos.entry_px + pos.unrealized_pnl / pos.size if pos.size else None
+        marks = {m: (implied if (implied is not None and m == first) else v.mark_price(m)) for m in used}
+        margins, (cash, equity) = sum_margins(s), ledger_equity(s, marks)
+    venue_cash = pos.account_value - pos.unrealized_pnl
+    gap = pos.account_value - equity  # negative: the venue holds LESS than the ledger says it should
+    ok = gap >= -RECONCILE_TOLERANCE  # extra cash on the venue is unassigned (e.g. dust), not a shortfall
     if not ok:
-        log.error("RECONCILIATION BREACH: strategy ledger cash %s exceeds dex cash %s", ledger, cash)
-    return {"ok": ok, "sum_strategy_margin_usd": num(margins), "ledger_cash_usd": num(ledger), "dex_cash_usd": num(cash),
-            "difference_usd": num(cash - ledger)}
+        log.error("RECONCILIATION BREACH: venue equity %s is %s below the strategies' ledger equity %s", pos.account_value, -gap, equity)
+    return {"ok": ok, "sum_strategy_margin_usd": num(margins), "ledger_cash_usd": num(cash), "dex_cash_usd": num(venue_cash),
+            "ledger_equity_usd": num(equity), "venue_equity_usd": num(pos.account_value),
+            "difference_usd": num(gap)}  # venue minus ledger equity
 
 
 # ---- refunds ----------------------------------------------------------------
@@ -397,7 +437,9 @@ def activate(sid: str) -> str:
                 st.activation_attempts += 1
                 s.add(st)
                 s.commit()
-                v.ensure_margin(st.market_id, sum_margins(s) + received)
+                if size > 0:  # before any money moves: an empty book must not even cost a margin transfer
+                    require_liquidity(st.market_id, False, size, "opening the hedge")
+                v.add_margin(st.market_id, received)  # exactly what was credited, never 'up to a target'
                 fill = v.set_position(st.id, st.market_id, -size, current_size=Decimal(0)) if size > 0 else None
             except ServiceError as e:
                 if st.activation_attempts >= settings.max_activation_attempts or e.code == "UNKNOWN_MARKET":
@@ -451,12 +493,13 @@ def _fail_and_refund(sid: str, reason: str) -> None:
     refund_received(sid, "deploy failed")
 
 
-def activate_ready() -> int:
+def activate_ready(skip: set[str] = frozenset()) -> int:
     """Retry activation for every fully funded strategy that is still pending (the first attempt may have hit a
     transient error). Returns how many were attempted."""
     with Session(engine) as s:
         ids = [st.id for st in s.exec(select(Strategy).where(Strategy.status == S_PENDING)).all()
                if (st.received_amount_usd or Decimal(0)) >= st.expected_amount_usd]
+    ids = [i for i in ids if i not in skip]  # one that was just attempted this tick waits for the next one
     for sid in ids:
         activate(sid)
     return len(ids)
@@ -480,7 +523,7 @@ def confirm_deposit(did: str) -> None:
             else:
                 refund_deposit = False
                 try:
-                    v.ensure_margin(st.market_id, sum_margins(s) + amount)
+                    v.add_margin(st.market_id, amount)
                 except ServiceError as e:  # the funds ARE ours now; record the credit and let reconciliation flag the gap
                     log.error("top-up %s credited but the venue margin could not be raised: %s %s", did, e.code, e.message)
                 st.margin_usd += amount
@@ -721,6 +764,12 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
     st = get_strategy(sid, org)
     if st.status != S_ACTIVE:
         raise ServiceError("CONFLICT", f"strategy is {st.status}; only an active strategy can be rebalanced", 409)
+    v0 = venue()
+    quantum0 = Decimal(1).scaleb(-v0.size_decimals(st.market_id))
+    gap0, gap_bps0 = hedge_gap(st)
+    if abs(gap0) >= quantum0 and (force or gap_bps0 > st.rebalance_band_bps):  # a trade would happen: is there a book to take it?
+        delta0 = -target_size(st) - st.size  # signed size the rebalance would trade: > 0 buys (shrinking a short), < 0 sells
+        require_liquidity(st.market_id, delta0 > 0, abs(delta0), "this rebalance")
     st, signer = authorize_action(sid, "rebalance", authorization, {}, org)
     v = venue()
     nonce = (authorization or {}).get("nonce")
@@ -749,6 +798,7 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
                                            f"but the strategy holds {cash:.2f}; add margin with a top-up first")
                 if ledger_drift(s, st.market_id):
                     raise ServiceError("CONFLICT", "the venue position differs from the ledger; rebalancing is held until it is reconciled", 409)
+                require_liquidity(st.market_id, (target_signed - st.size) > 0, abs(target_signed - st.size), "this rebalance")  # again, now
                 st.status = S_REBALANCING
                 s.add(st)
                 s.commit()

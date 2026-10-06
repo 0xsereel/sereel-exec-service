@@ -100,7 +100,8 @@ def _refund_unmatched(sig: str, sender: str | None, amount: Decimal, strategy_id
     log.info("refunded %s to %s: %s", amount, sender, why)
 
 
-def process_signature(sig: str, funding: str) -> None:
+def process_signature(sig: str, funding: str) -> str | None:
+    """Handle one finalized transfer. Returns the strategy id an activation was just attempted for, if any."""
     with Session(engine) as s:
         if s.get(ChainTransfer, sig):
             return
@@ -143,7 +144,11 @@ def process_signature(sig: str, funding: str) -> None:
         s.commit()  # credit and disposition land together
     log.info("credited %s to %s %s (%s)", amount, kind, ref, "funded" if funded else "still short")
     if funded:
-        service.activate(ref) if kind == "deploy" else service.confirm_deposit(ref)
+        if kind == "deploy":
+            service.activate(ref)
+            return ref
+        service.confirm_deposit(ref)
+    return None
 
 
 def mark_stale_claims() -> int:
@@ -172,12 +177,13 @@ def watch_once() -> dict:
     funding = service.funding_address()
     with Session(engine) as s:
         cursor = s.get(WatcherCursor, CURSOR).last_signature
-    handled = 0
+    handled, attempted = 0, set()
     for sig in sol.finalized_signatures_since(funding, cursor):
-        process_signature(sig, funding)  # an error stops the tick here and the cursor stays put: it is retried
+        if (sid := process_signature(sig, funding)):  # an error stops the tick here and the cursor stays put: it is retried
+            attempted.add(sid)
         _set_cursor(sig)
         handled += 1
-    return {"transfers": handled, "activations": service.activate_ready(), "expired": service.expire_due(),
+    return {"transfers": handled, "activations": service.activate_ready(skip=attempted), "expired": service.expire_due(),
             "withdrawals": withdrawals.advance_pending()}
 
 

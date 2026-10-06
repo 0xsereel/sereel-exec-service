@@ -143,7 +143,15 @@ def from_base(raw: int | str) -> Decimal:
 def send(instructions: list, signers: list[Keypair], commitment: str = "confirmed", timeout: float = 60) -> str:
     bh = Hash.from_string(rpc("getLatestBlockhash", [{"commitment": "finalized"}])["value"]["blockhash"])
     tx = Transaction(signers, Message.new_with_blockhash(instructions, signers[0].pubkey(), bh), bh)
-    sig = rpc("sendTransaction", [base64.b64encode(bytes(tx)).decode(), {"encoding": "base64", "preflightCommitment": "confirmed"}])
+    local_sig = str(tx.signatures[0])
+    try:
+        sig = rpc("sendTransaction", [base64.b64encode(bytes(tx)).decode(), {"encoding": "base64", "preflightCommitment": "confirmed"}])
+    except SolanaError as e:
+        # rpc() retries on timeouts/5xx, so a send that LANDED but whose response was lost is resent and answered
+        # "AlreadyProcessed". That means our transaction exists: carry on and confirm it by its own signature.
+        if "AlreadyProcessed" not in str(e):
+            raise
+        sig = local_sig
     ok = ("confirmed", "finalized") if commitment == "confirmed" else ("finalized",)
     deadline = time.time() + timeout
     while time.time() < deadline:

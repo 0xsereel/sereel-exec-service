@@ -1,8 +1,88 @@
 # sereel-exec-service
 
-FastAPI execution service for Sereel delta-neutral hedges: Solana devnet funding and attestations, Hyperliquid
-testnet hedging (`xyz:GOLD`, a HIP-3 market), a testnet market maker, and payouts. *(Work in progress; sections are
-added as each part lands.)*
+FastAPI execution service for Sereel delta-neutral hedges. It takes stablecoin funding from a manager's Solana wallet,
+runs the hedge on **Hyperliquid testnet** (`xyz:GOLD`, a HIP-3 market), reports value back, attests every action on **Solana
+devnet**, pays out stablecoins on schedules, and ships a testnet market maker. Cantina calls it by base URL and API key.
+
+**Networks:** Hyperliquid testnet and Solana devnet only. The service refuses to start against mainnet unless
+`ALLOW_MAINNET=true`, and the market maker refuses mainnet no matter what.
+
+## Quick start (clean machine to a running demo)
+
+```bash
+# 1. install (Python 3.11+)
+python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
+
+# 2. configure: copy and fill in .env (see .env.example for every setting)
+cp .env.example .env
+#    required: API_KEY (any long random string), PYTH_API_KEY, and the Hyperliquid testnet values below
+
+# 3. keys, database, mint: prints ONLY the funding wallet address, then waits
+sereel init
+#    -> send devnet SOL to that address at https://faucet.solana.com (choose Devnet); `init` then distributes SOL to the
+#       other wallets, creates the stablecoin mint, runs `alembic upgrade head`, and checks Hyperliquid.
+#    -> BACK UP keys/ and .env somewhere outside this repository now.
+
+# 4. run the API (with the market maker alongside, on testnet)
+sereel serve --mm            # http://localhost:8000
+
+# 5. expose it to Cantina
+ngrok http 8000              # paste the https URL and API_KEY into Cantina > Settings > Integrations
+```
+
+**Hyperliquid testnet setup (once).** Two accounts: the **master** (holds margin) and a second **market-maker** account.
+For the master: fund it with testnet USDC (the faucet only works for accounts with mainnet deposit history, so fund it from
+another account), approve an **API (agent) wallet** for it, and set `HL_ACCOUNT_ADDRESS`, `HL_API_WALLET_KEY` and, for
+development only, `HL_MASTER_KEY` (moving margin to the `xyz` dex is a user-signed action; see the permission model).
+For the market maker set `HL_MM_ACCOUNT_ADDRESS` and `HL_MM_API_WALLET_KEY` (its own key works) and put USDC in it. Check
+everything with `sereel init`: it prints the resolved `xyz:GOLD` asset id (750003 on testnet), mark and oracle, the margin on
+the dex, and each account's mode.
+
+**What to expect when you run it.**
+- `GET /health` (no key) shows the leverage assertion for `xyz:GOLD` (`ok: false` until the first order sets it to 3x), the
+  reconciliation, and `unresolved_transfers` / `unresolved_withdrawals` (both should be 0).
+- A strategy is created with `POST /strategies`; the client then sends a transfer **with the intent id as the memo**; about
+  15-30 seconds later (finalization) the strategy is `active` with a live short. See "Strategies and funding intents".
+- **The market maker must be running** for orders to fill on this thin testnet book. Without it, deploy, rebalance and close
+  fail with `NO_LIQUIDITY` and send nothing (see below).
+
+**Day-to-day commands**
+
+| Command | What it does |
+|---|---|
+| `sereel serve [--mm]` | the API, the payout scheduler, the deposit watcher, the minute P&L snapshots; `--mm` also runs the market maker |
+| `sereel mm run --market XAU-HL` / `mm stop` | the market maker on its own (stop = cancel quotes, flatten reduce-only) |
+| `sereel strategies list [--all] [--json]` | strategies with position, value and margin health (asks the running API) |
+| `sereel strategies set-owner <id> --pubkey/--multisig` | operator: bind an owner to an ownerless strategy |
+| `sereel strategies retry-withdrawal <id> [--confirm-not-sent]` | operator: resume a failed withdrawal |
+| `sereel payouts new / run / list / pause / resume / stop / send` | scheduled and one-off stablecoin payouts |
+| `alembic upgrade head` / `alembic revision --autogenerate -m "..."` | database migrations |
+| `pytest` | the test suite (no network needed; it uses a simulated venue and a fake chain) |
+
+**Signing from a client.** Every call that moves nothing on Solana (edit, rebalance, close, return excess, change owner) carries
+a signed message. The exact format, with test vectors a client author can check byte for byte, is in "Signed-message
+authorization and strategy ownership". For local development without a signer, `DEV_AUTH_BYPASS=true` skips it (off
+mainnet only, logged on every request).
+
+**Troubleshooting**
+- `NO_LIQUIDITY`: nothing is offering the size you need. Start the market maker (`sereel serve --mm`, or `sereel mm run`).
+  On testnet the market maker is effectively the only liquidity; once it is stopped the book can be empty.
+- `STALE_PRICE` / `PRICE_SOURCE_AUTH`: Pyth is unreachable or rejected `PYTH_API_KEY`. A *closed* market is not an error (see
+  "Closed markets").
+- `/health` shows `reconciliation.ok: false`: the venue holds less than the strategies' ledger says. See "Reconciliation".
+- A funded strategy stuck in `pending_funding` with a `failure_reason`: it is retrying (the reason says why); after
+  `MAX_ACTIVATION_ATTEMPTS` it fails and the funding is refunded to the sender.
+- **Startup is slow, or fails with `VENUE_UNAVAILABLE` ("Hyperliquid did not answer while loading market metadata").**
+  Starting up downloads Hyperliquid's market metadata, which is large; on a slow testnet that can take a minute (a cold start
+  took 49 s when Hyperliquid answered in 7-11 s per call). There is **one** download shared by every client, it uses
+  `HL_CONNECT_TIMEOUT_S` (default 60 s) and is retried `HL_CONNECT_ATTEMPTS` (default 4) times with a growing pause. Raise
+  those if your connection is worse; the service then says which step failed and after how many attempts.
+- **A process that will not exit** (a server or market maker stuck in shutdown): the Hyperliquid SDK defaults to **no request
+  timeout**, so a silent connection blocks a thread forever. Once connected, every Hyperliquid client here drops to
+  `HL_REQUEST_TIMEOUT_S` (default 15 s), and a test fails if any new client is created without a timeout. Solana and Pyth
+  calls already have timeouts.
+- Hyperliquid or Pyth being slow (seconds per call) delays everything and can leave gaps between the market maker's
+  cancel-and-replace cycles; give it time or use `sereel mm run --center mark`.
 
 ## Hyperliquid account modes (abstraction)
 
@@ -34,8 +114,12 @@ have a counterparty on the thin testnet book. It refuses to start unless `HL_API
   run the mark-oracle gap fell from +51 to about +4..+7 while quoting, and re-opened after the maker stopped.
 - **Inventory control:** quotes skew against inventory (long: both sides lower; short: both sides higher, up to
   `skew_bps` at the inventory limit), and the side that would grow inventory past `max_inventory` is dropped.
+- **Startup:** if the account still holds inventory from a previous run, the maker cancels stale quotes and flattens it
+  **reduce-only before quoting normally**, as soon as the book has anything to take it. It waits up to `--flatten-wait`
+  seconds (default 60); if the book never allows it, it starts quoting anyway, skewed against the inventory.
 - **Shutdown:** Ctrl-C, SIGTERM or `sereel mm stop` cancels all quotes and flattens the position with a
-  **reduce-only IOC**.
+  **reduce-only IOC**. With `sereel serve --mm` the maker runs inside the server (no pidfile, so `mm stop` never signals the
+  server) and is stopped when the server stops.
 - **Limit of the flatten.** On this testnet the MM is effectively the only liquidity. Once it cancels its quotes the book
   can be empty, so the flatten may leave residual inventory (seen live: 0.0719 oz long left because no bid existed at
   any price near the market). That is expected, not a bug: restart the MM and it trades out (long inventory skews its
@@ -146,9 +230,20 @@ and growing are not. A trade that would flip through zero is not reduce-only.
 and the schedule says the market is closed, the service uses the last Pyth price and sets `market_closed: true`
 instead of failing with `STALE_PRICE`, so the demo works outside gold trading hours.
 
-**Reconciliation.** `/health` reports `reconciliation`: the strategies' **ledger cash** (credited margin + realized P&L +
-funding - fees) must not exceed the cash on the venue's dex balance (account value minus unrealized P&L). A breach is
-logged as an error. Fees are accounted for exactly; the tolerance (5 cents) covers rounding only.
+**Margin reaches the venue exactly.** When a deposit is credited the service moves *exactly that amount* onto the market's dex
+balance (`add_margin`); it never tops the dex up "to a target". (An earlier version did, measured against `accountValue`,
+which includes unrealized P&L; that moved less cash than it credited and, when the strategy later left, the other
+strategies' pot covered the difference. It was found as a 43-cent shortfall on testnet, hidden behind a cash-based check.)
+
+**Reconciliation.** `/health` reports `reconciliation`. It compares **equity**: the venue's `accountValue` against the sum of
+what the strategies are entitled to (credited margin + realized P&L + funding - fees + unrealized P&L at the mark),
+`difference_usd` = venue minus ledger. It does **not** compare cash, because Hyperliquid realizes a close against the
+blended *account* entry while the ledger realizes it against each strategy's own entry: the cash figures legitimately differ,
+and the amount reappears in unrealized P&L, so in equity terms it cancels exactly. The ledger is marked at the price
+*implied by the same Hyperliquid snapshot* as `accountValue` (entry + unrealized / size), not at a separate mark read, because
+two reads seconds apart differ by (position size x the price move between them) and look like drift. `ok` is false only if the
+venue holds **more than 5 cents less** than the ledger; surplus venue cash (dust that belongs to no strategy) is not an
+alarm. The tolerance covers rounding only: fees, realized P&L and unrealized P&L are accounted for exactly.
 
 **Liquidation price.** `position.liquidation_price_usd` is the nearer of the service's own figure (assuming all of the
 strategy's margin backs the position) and the venue's reported liquidation price for the shared account position, so it
@@ -223,12 +318,18 @@ requested -> position_closed -> released -> bridging -> completed          (fail
 For a close the final `amount_usd` is the ledger's finalized figure (the amount at `requested` is an estimate). The
 attestation covers the close fills, release, route and payout signature.
 
-**Liquidity.** Before sending anything, a close checks the book: it needs the strategy's whole size offered within the
+**Liquidity.** The same rule applies to **close, rebalance and deploy**. Before sending anything, an order checks the book: it needs the strategy's whole size offered within the
 IOC's 0.5% slippage band of the mark. If not, the request fails with **`NO_LIQUIDITY`** (HTTP 409), says how much is
 offered and how much is needed, tells you to start the market maker, **sends nothing, and does not spend the signature**
 (the same signed request works once the book is back). The check runs again when the step executes, so a book that
 empties in between fails the withdrawal cleanly (the strategy goes back to `active`) instead of retrying into nothing.
 Partial closes keep the strategy `closing` with the reduced size; closing again finishes it.
+
+- **Rebalance** checks only when a trade would actually happen (a within-band or no-op call needs no book), for the size it
+  would trade, before the signature is spent and again under the account lock.
+- **Deploy** has no waiting client, so a funded strategy that finds no book keeps its funds and retries on the next watcher
+  ticks (`failure_reason` says `NO_LIQUIDITY ... retrying, attempt n`) with **no order sent and no margin moved**; after
+  `MAX_ACTIVATION_ATTEMPTS` it fails and the funding is refunded. Deploy needs the whole target size, like close.
 
 **Failure rules.**
 - Failed **before anything was traded**: the strategy returns to `active`.
@@ -372,6 +473,47 @@ a dev machine.
 
 *Tested against a real devnet Squads account* (captured in `tests/fixtures/`), not only synthetic data; the account
 layout was checked against Squads' source (`state/multisig.rs`).
+
+## Cantina contract (v4)
+
+`tests/test_contract.py` encodes the v4 document field by field and runs it against the real API: the Strategy, position,
+StrategyDeposit and StrategyWithdrawal objects, `/value`, the three status enums, `200` on every success (including
+`DELETE`, which takes a body and returns a withdrawal), bare-array lists, ISO 8601 timestamps, money as JSON numbers, basis
+points as integers, opaque string ids, `X-Sereel-Key` on every route but `/health`, 404 for another org's strategy, and the
+non-2xx body `{"error", "code"}`. Mutating the API in any of those ways fails the suite.
+
+**Deliberate deviations from the v4 document** (decided with the product owner; the frontend must follow):
+1. `POST /strategies` requires `owner_pubkey` **or** `owner_multisig` (a Squads multisig *account*).
+2. In the signed calls (`PATCH`, `POST .../withdrawals`) `hedge_ratio_bps`, `target_exposure_units` and `amount_usd` are
+   **strings** in the body, and the same strings are signed. A JSON number is `AUTHORIZATION_INVALID`.
+3. Additive fields (ignored by a tolerant client): on the strategy `owner_pubkey`, `owner_multisig`, `market_closed`,
+   `failure_reason`, `hedge_gap_units`, `hedge_gap_bps`; on `/value` `hedge_pnl_usd`, `attestation_sig`,
+   `attestation_url`, `market_closed`. Extra routes: `POST /strategies/{id}/owner`, `GET /strategies/{id}/deposits[/{did}]`,
+   `GET /strategies/{id}/history`, `GET /strategies/{id}/withdrawals`, `GET /markets`.
+
+`/health` and `/markets` were out of scope in v4, so they follow the original spec: `/health` has version, venue, the
+Hyperliquid network and account margin, the Solana network, funding address, stablecoin mint and the active strategy and
+schedule counts (plus the leverage assertion, reconciliation and unresolved counters); `/markets` lists each market with the
+live Hyperliquid mark and Pyth price. If Cantina needs those two written down as a contract, send it and the tests will
+encode it.
+
+## Known limitations
+
+- **Production funding route is a stub.** `CctpHyperliquidRoute` (Solana USDC to CCTP to Arbitrum to the Hyperliquid bridge,
+  and back) is not implemented; testnet uses `MirroredRoute`, which moves nothing. A production withdrawal fails clearly at
+  the bridging step.
+- **Hyperliquid bridge withdrawal is unverified live.** `withdraw_to_arbitrum` is implemented and unit-tested, but the testnet
+  rejected it for an account funded by an internal transfer; to be re-verified with a bridge-funded account.
+- **Funding payments are unverified live.** `xyz:GOLD`'s funding rate has been 0, so the real funding-history entry shape has not
+  been seen; the code follows Hyperliquid's documented shape.
+- **One account, a per-strategy ledger.** All strategies share one Hyperliquid account and one `xyz:GOLD` position. Production
+  should use one subaccount or vault per fund (subaccounts need $100,000 of volume; legacy vaults cost 10,000 USDC, need a
+  100 USDC deposit, a leader holding at least 5%, and pay the leader a 10% profit share).
+- **Thin testnet liquidity.** The market maker is effectively the only liquidity, and it can leave residual inventory when
+  stopped into an empty book. At high Hyperliquid latency its cancel-and-replace cycle leaves gaps with no quotes.
+- **No automatic Solana payout retry** (by design: a timeout can still land), and a crash mid-handling marks a transfer
+  `refund_unconfirmed` for a person to resolve.
+- **Single process.** The deposit watcher, scheduler and withdrawal machine assume one running service per database.
 
 ## Error codes
 

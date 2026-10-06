@@ -118,27 +118,93 @@ def init(
                   "They hold the only copies of your Solana and Hyperliquid keys; neither is recoverable.")
 
 
-# ---- serve ------------------------------------------------------------------
-
-@app.command()
-def serve(host: str = "0.0.0.0", port: int = 8000):
-    """Start the API (the payout scheduler, deposit watcher and snapshots run inside it)."""
-    import uvicorn
-
-    try:
-        settings.assert_network_safe()
-    except RuntimeError as e:
-        _fail(str(e))
-    if not settings.api_key:
-        _fail("API_KEY is empty: the API would reject every request. Set API_KEY in .env.")
-    uvicorn.run("app.main:app", host=host, port=port)
-
-
-# ---- market maker -----------------------------------------------------------
+# ---- market maker config (shared by `mm run` and `serve --mm`) ----------------------------
 
 def _mm_profile(market: str):
     return ROOT / "profiles" / f"mm-{market}.yaml"
 
+
+def _build_mm(market: str, spread_bps=None, levels=None, size=None, center=None, max_inventory=None, flatten_wait=60.0,
+              save=True, interactive=True):
+    """Resolve flags > saved profile > prompt (or defaults when not interactive) into a MarketMaker. Raises ServiceError."""
+    from app.mm.market_maker import MarketMaker, MMConfig, assert_testnet
+
+    assert_testnet()
+    markets = load_markets()
+    if market not in markets:
+        _fail(f"unknown market {market}; known: {', '.join(markets)}")
+    prof = _mm_profile(market)
+    saved = yaml.safe_load(prof.read_text()) if prof.exists() else {}
+    defaults = {"spread_bps": 10.0, "levels": 3, "size": 0.03, "center": "oracle"}
+
+    def pick(flag, key, prompt):
+        if flag is not None:
+            return flag
+        if saved.get(key) is not None:
+            return saved[key]
+        return typer.prompt(prompt, default=defaults[key]) if interactive else defaults[key]
+
+    cfg = MMConfig(
+        market_id=market,
+        spread_bps=Decimal(str(pick(spread_bps, "spread_bps", "Spread per level (bps)"))),
+        levels=int(pick(levels, "levels", "Levels per side")),
+        size=Decimal(str(pick(size, "size", "Size per level (coin units)"))),
+        center=str(pick(center, "center", "Center on (oracle/pyth/mark)")),
+        flatten_wait_s=flatten_wait,
+        max_inventory=Decimal(str(max_inventory)) if max_inventory is not None
+        else (Decimal(str(saved["max_inventory"])) if saved.get("max_inventory") is not None else None),
+    )
+    if save:
+        prof.parent.mkdir(exist_ok=True)
+        prof.write_text(yaml.safe_dump({"spread_bps": float(cfg.spread_bps), "levels": cfg.levels, "size": float(cfg.size),
+                                        "center": cfg.center, "max_inventory": float(cfg.max_inventory)}))
+    return MarketMaker(markets[market], cfg)
+
+
+# ---- serve ------------------------------------------------------------------
+
+@app.command()
+def serve(
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    mm: bool = typer.Option(False, "--mm", help="Also run the testnet market maker inside this process"),
+    mm_market: str = typer.Option(None, "--mm-market", help="Market to quote (default: the first in markets.yaml)"),
+    mm_size: float = typer.Option(None, "--mm-size"),
+    mm_center: str = typer.Option(None, "--mm-center", help="oracle | pyth | mark"),
+    mm_flatten_wait: float = typer.Option(60, "--mm-flatten-wait"),
+):
+    """Start the API (the payout scheduler, deposit watcher and snapshots run inside it). With --mm the testnet market maker
+    runs alongside, from its saved profile (or defaults), and is stopped, flattening reduce-only, when the server stops."""
+    import threading
+
+    import uvicorn
+
+    try:
+        settings.assert_network_safe()
+        settings.assert_auth_config_safe()
+    except RuntimeError as e:
+        _fail(str(e))
+    if not settings.api_key:
+        _fail("API_KEY is empty: the API would reject every request. Set API_KEY in .env.")
+    maker = thread = None
+    if mm:
+        try:
+            market = mm_market or next(iter(load_markets()))
+            maker = _build_mm(market, size=mm_size, center=mm_center, flatten_wait=mm_flatten_wait, save=False, interactive=False)
+        except ServiceError as e:
+            _fail(f"{e.code}: {e.message}")
+        thread = threading.Thread(target=maker.run, kwargs={"manage_pid": False}, name="market-maker")
+        thread.start()
+        console.print(f"[yellow]market maker running inside the server ({market}); stop it by stopping the server[/]")
+    try:
+        uvicorn.run("app.main:app", host=host, port=port)
+    finally:
+        if maker:  # cancel quotes and flatten reduce-only before the process exits
+            maker.stop()
+            thread.join(timeout=120)
+
+
+# ---- market maker -----------------------------------------------------------
 
 @mm_app.command("run")
 def mm_run(
@@ -148,40 +214,12 @@ def mm_run(
     size: float = typer.Option(None, "--size", help="Per-level size in coin units (0.02-0.05 by default)"),
     center: str = typer.Option(None, "--center", help="oracle | pyth | mark"),
     max_inventory: float = typer.Option(None, "--max-inventory"),
+    flatten_wait: float = typer.Option(60, "--flatten-wait", help="Seconds to wait on startup for the book to let leftover inventory be flattened"),
     save: bool = typer.Option(True, help="Save these settings as profiles/mm-<market>.yaml"),
 ):
     """Run the testnet market maker. Refuses unless HL_API_URL is testnet. Ctrl-C / `mm stop` cancels and flattens."""
-    from app.mm.market_maker import MarketMaker, MMConfig, assert_testnet
-
     try:
-        assert_testnet()
-        markets = load_markets()
-        if market not in markets:
-            _fail(f"unknown market {market}; known: {', '.join(markets)}")
-        prof = _mm_profile(market)
-        saved = yaml.safe_load(prof.read_text()) if prof.exists() else {}
-
-        def pick(flag, key, prompt, default):
-            if flag is not None:
-                return flag
-            if saved.get(key) is not None:
-                return saved[key]
-            return typer.prompt(prompt, default=default)
-
-        cfg = MMConfig(
-            market_id=market,
-            spread_bps=Decimal(str(pick(spread_bps, "spread_bps", "Spread per level (bps)", 10.0))),
-            levels=int(pick(levels, "levels", "Levels per side", 3)),
-            size=Decimal(str(pick(size, "size", "Size per level (coin units)", 0.03))),
-            center=str(pick(center, "center", "Center on (oracle/pyth/mark)", "oracle")),
-            max_inventory=Decimal(str(max_inventory)) if max_inventory is not None
-            else (Decimal(str(saved["max_inventory"])) if saved.get("max_inventory") is not None else None),
-        )
-        if save:
-            prof.parent.mkdir(exist_ok=True)
-            prof.write_text(yaml.safe_dump({"spread_bps": float(cfg.spread_bps), "levels": cfg.levels, "size": float(cfg.size),
-                                            "center": cfg.center, "max_inventory": float(cfg.max_inventory)}))
-        mm = MarketMaker(markets[market], cfg)
+        mm = _build_mm(market, spread_bps, levels, size, center, max_inventory, flatten_wait, save)
     except ServiceError as e:
         _fail(f"{e.code}: {e.message}")
     signal.signal(signal.SIGTERM, lambda *_: mm.stop())  # `mm stop` -> graceful shutdown (cancel + reduce-only flatten)

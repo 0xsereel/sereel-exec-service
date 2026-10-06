@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     attest_keypair: str = "./keys/attest.json"
     payment_source_keypair: str = "./keys/payment_source.json"
 
+    hl_connect_timeout_s: float = 60  # while connecting only: the one-off metadata downloads are large and Hyperliquid can be slow
+    hl_connect_attempts: int = 4  # a failed connect step is retried (with a growing pause) before giving up
+    hl_request_timeout_s: float = 15  # every Hyperliquid call: the SDK default is NO timeout, so a silent peer blocks a thread forever
     hl_api_url: str = "https://api.hyperliquid-testnet.xyz"
     hl_account_address: str = ""
     hl_api_wallet_key: str = ""

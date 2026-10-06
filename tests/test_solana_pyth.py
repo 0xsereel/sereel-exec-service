@@ -153,3 +153,43 @@ def test_signature_paging_oldest_first_skips_failed_and_chains_before(monkeypatc
 def test_signature_paging_is_capped(monkeypatch):
     monkeypatch.setattr(sol, "rpc", lambda m, p: [{"signature": f"x{len(p)}", "err": None}] * 2)
     assert len(sol.finalized_signatures_since("A", None, limit=2, max_pages=3)) == 6
+
+
+def test_a_send_whose_first_attempt_landed_is_confirmed_not_failed(monkeypatch):
+    """The retry of a lost-response send gets AlreadyProcessed: the transaction is on-chain, so it must succeed."""
+    kp = Keypair()
+    calls = []
+
+    def fake_rpc(method, params=None, retries=4):
+        calls.append(method)
+        if method == "getLatestBlockhash":
+            return {"value": {"blockhash": str(__import__("solders.hash", fromlist=["Hash"]).Hash.default())}}
+        if method == "sendTransaction":
+            raise sol.SolanaError("sendTransaction: {'code': -32002, 'message': 'Transaction simulation failed: This transaction has "
+                                  "already been processed', 'data': {'err': 'AlreadyProcessed'}}")
+        if method == "getSignatureStatuses":
+            return {"value": [{"err": None, "confirmationStatus": "confirmed"}]}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(sol, "rpc", fake_rpc)
+    from solders.system_program import TransferParams, transfer
+
+    ix = transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=Keypair().pubkey(), lamports=1))
+    sig = sol.send([ix], [kp])
+    assert isinstance(sig, str) and len(sig) > 40 and "getSignatureStatuses" in calls  # confirmed by its own signature
+
+
+def test_other_send_errors_still_fail(monkeypatch):
+    kp = Keypair()
+
+    def fake_rpc(method, params=None, retries=4):
+        if method == "getLatestBlockhash":
+            return {"value": {"blockhash": str(__import__("solders.hash", fromlist=["Hash"]).Hash.default())}}
+        raise sol.SolanaError("sendTransaction: {'code': -32002, 'message': 'Transaction simulation failed: insufficient funds'}")
+
+    monkeypatch.setattr(sol, "rpc", fake_rpc)
+    from solders.system_program import TransferParams, transfer
+
+    ix = transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=Keypair().pubkey(), lamports=1))
+    with pytest.raises(sol.SolanaError, match="insufficient funds"):
+        sol.send([ix], [kp])

@@ -67,6 +67,13 @@ class SimulatedVenue(VenueAdapter):
         self.funds -= need
         self._cash[market_id] = usd_amount
 
+    def add_margin(self, market_id, usd_amount):
+        amount = Decimal(usd_amount)
+        if amount > self.funds:
+            raise ServiceError("INSUFFICIENT_MARGIN", f"need {amount} on the dex but only {self.funds} is available")
+        self.funds -= amount
+        self._cash[market_id] = self._cash.get(market_id, Decimal(0)) + amount
+
     def release_margin(self, market_id: str, usd_amount: Decimal) -> None:
         """Move USDC from the dex balance back to the main balance (withdrawal path)."""
         self._cash[market_id] = self._cash.get(market_id, Decimal(0)) - usd_amount
