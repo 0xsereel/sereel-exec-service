@@ -64,9 +64,12 @@ def venue():
 
 def market(market_id: str):
     try:
-        return state.markets[market_id]
+        m = state.markets[market_id]
     except KeyError:
         raise _bad(f"unknown market '{market_id}'", "UNKNOWN_MARKET")
+    if not m.enabled:  # the same switch that lists it as "coming_soon": the API must not accept what the UI disables
+        raise _bad(f"market '{market_id}' is {m.status}: new strategies cannot be created on it yet")
+    return m
 
 
 def funding_address() -> str:
@@ -303,6 +306,44 @@ def require_liquidity(market_id: str, is_buy: bool, need: Decimal, what: str) ->
                            f"Nothing was sent. Start the market maker (sereel mm run --market {market_id}) and retry.", 409)
 
 
+def operator_adjust_ledger(sid: str, realized_delta: Decimal, reason: str) -> tuple[Strategy, Decimal]:
+    """OPERATOR ONLY (CLI on the host; no API route). Book a correction into a live strategy's realized P&L, with a written
+    reason, attested. For known historical errors only (e.g. money that left a strategy's pot because of a since-fixed bug); it
+    changes what the strategy is entitled to, so the reason is mandatory and the same reason cannot be booked twice."""
+    reason = (reason or "").strip()
+    if len(reason) < 20:
+        raise _bad("a reason of at least 20 characters is required: say what happened, so the ledger entry explains itself")
+    if realized_delta == 0:
+        raise _bad("the adjustment is zero")
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        if st is None:
+            raise ServiceError("NOT_FOUND", "strategy not found", 404)
+        if st.status not in LIVE:
+            raise ServiceError("CONFLICT", f"strategy is {st.status}; only a live strategy's ledger can be adjusted", 409)
+        for a in s.exec(select(Action).where(Action.strategy_id == sid, Action.action == "ledger_adjustment")).all():
+            if (a.record or {}).get("reason") == reason:
+                raise ServiceError("CONFLICT", f"this reason was already booked on {a.created_at:%Y-%m-%d %H:%M} UTC; "
+                                   "an adjustment is booked once", 409)
+        before = st.realized_pnl_usd
+        st.realized_pnl_usd = before + realized_delta
+        st.updated_at = now()
+        s.add(st)
+        s.commit()
+        after, fund = st.realized_pnl_usd, st.fund_id
+    record = {"event": "ledger_adjustment", "booked_by": "operator", "field": "realized_pnl_usd", "delta": realized_delta,
+              "before": before, "after": after, "reason": reason}
+    asig = _record_action(sid, "ledger_adjustment", record, fund)
+    with Session(engine) as s:
+        st = s.get(Strategy, sid)
+        st.last_attestation_sig = asig or st.last_attestation_sig
+        s.add(st)
+        s.commit()
+        s.refresh(st)
+    take_snapshot(sid, "ledger_adjustment")
+    return st, before
+
+
 # ---- ledger helpers ---------------------------------------------------------
 
 def sum_margins(s: Session, exclude: str | None = None) -> Decimal:
@@ -421,8 +462,9 @@ def refund_received(sid: str, reason: str) -> None:
 def activate(sid: str) -> str:
     """Open the hedge for a fully funded strategy: margin, leverage, reduce-never short at exposure x ratio, attest.
 
-    Returns active | retry | failed | skipped | drift. Transient venue/price errors are retried on later watcher ticks
-    (up to MAX_ACTIVATION_ATTEMPTS); after that the strategy fails and the funding is refunded."""
+    Returns active | retry | failed | skipped | drift. Transient venue/price errors (including NO_LIQUIDITY) are retried on later
+    watcher ticks for ACTIVATION_GRACE_S seconds measured from when funding completed (time, not attempts: attempts vary with how
+    slow the venue is and how many ticks run); after that the strategy fails and the funding is refunded."""
     v = venue()
     with account_lock(v.account_key):
         with Session(engine) as s:
@@ -435,6 +477,8 @@ def activate(sid: str) -> str:
                     log.error("activation of %s held: venue position differs from the ledger by %s", sid, ledger_drift(s, st.market_id))
                     return "drift"
                 st.activation_attempts += 1
+                if st.funded_at is None:  # funded before this field existed: the window starts at the first attempt we see
+                    st.funded_at = now()
                 s.add(st)
                 s.commit()
                 if size > 0:  # before any money moves: an empty book must not even cost a margin transfer
@@ -442,10 +486,13 @@ def activate(sid: str) -> str:
                 v.add_margin(st.market_id, received)  # exactly what was credited, never 'up to a target'
                 fill = v.set_position(st.id, st.market_id, -size, current_size=Decimal(0)) if size > 0 else None
             except ServiceError as e:
-                if st.activation_attempts >= settings.max_activation_attempts or e.code == "UNKNOWN_MARKET":
+                waited = (now() - st.funded_at).total_seconds()
+                if waited >= settings.activation_grace_s or e.code == "UNKNOWN_MARKET":
                     outcome, reason = "failed", f"{e.code}: {e.message}"
                 else:
-                    st.failure_reason = f"{e.code}: {e.message} (retrying, attempt {st.activation_attempts})"
+                    left = settings.activation_grace_s - waited
+                    st.failure_reason = (f"{e.code}: {e.message} (retrying, attempt {st.activation_attempts}; "
+                                         f"gives up and refunds in {left:.0f}s)")
                     s.add(st)
                     s.commit()
                     log.warning("activation of %s will retry: %s", sid, st.failure_reason)

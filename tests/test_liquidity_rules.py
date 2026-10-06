@@ -12,7 +12,7 @@ from app.models import UsedNonce
 from app.state import state
 from app.strategies import service, watcher
 from test_step1 import M, OWNER, active, create, fund, get, patch, rebalance, set_price
-from test_strategies import rows
+from test_strategies import age_funding, rows
 
 D = Decimal
 
@@ -62,13 +62,15 @@ def test_deploy_activates_on_a_later_tick_once_the_book_is_back(api, fakechain):
     assert get(api, s["id"])["status"] == "active" and state.venue.position(None, M).size == D("-0.12")
 
 
-def test_deploy_that_never_finds_liquidity_fails_clearly_and_refunds(api, fakechain, monkeypatch):
-    monkeypatch.setattr(settings, "max_activation_attempts", 3)
+def test_deploy_that_never_finds_liquidity_fails_clearly_and_refunds(api, fakechain):
     state.venue.liquidity = D(0)
     s = create(api)
     fund(api, fakechain, s)
-    for _ in range(2):
+    for _ in range(3):
         watcher.watch_once()
+    assert get(api, s["id"])["status"] == "pending_funding"  # still inside the window: waiting, not failing
+    age_funding(s["id"], settings.activation_grace_s)
+    watcher.watch_once()
     a = get(api, s["id"])
     assert a["status"] == "failed" and a["failure_reason"].startswith("NO_LIQUIDITY")
     assert state.venue.orders == [] and fakechain.refunds[0][:2] == (s["registered_sender_address"], D("127.2"))

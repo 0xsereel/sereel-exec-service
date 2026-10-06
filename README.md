@@ -71,7 +71,7 @@ mainnet only, logged on every request).
   "Closed markets").
 - `/health` shows `reconciliation.ok: false`: the venue holds less than the strategies' ledger says. See "Reconciliation".
 - A funded strategy stuck in `pending_funding` with a `failure_reason`: it is retrying (the reason says why); after
-  `MAX_ACTIVATION_ATTEMPTS` it fails and the funding is refunded to the sender.
+  `ACTIVATION_GRACE_S` it fails and the funding is refunded to the sender.
 - **Startup is slow, or fails with `VENUE_UNAVAILABLE` ("Hyperliquid did not answer while loading market metadata").**
   Starting up downloads Hyperliquid's market metadata, which is large; on a slow testnet that can take a minute (a cold start
   took 49 s when Hyperliquid answered in 7-11 s per call). There is **one** download shared by every client, it uses
@@ -201,7 +201,7 @@ venue against a fund's exposure. Funding is by **intent**; the client never subm
    so no hint field is needed). A deposit that finalizes after expiry or cancel is refunded; partial funding is
    refunded when an intent expires or is cancelled.
 4. **Activation**: margin is raised on the venue, leverage is set (see below), and the short is opened with IOC orders.
-   Transient failures (price deviation, stale price, no fill) are retried every tick up to `MAX_ACTIVATION_ATTEMPTS`;
+   Transient failures (price deviation, stale price, no fill, no book) are retried every tick for `ACTIVATION_GRACE_S` seconds (default 120) measured from when funding completed;
    after that the strategy is `failed` and the funding is refunded. A partial fill activates with the size actually
    filled. Activation is **held, not failed**, if the venue position differs from the ledger by more than one size
    step (a position the ledger cannot explain): trading on top of it would compound the error.
@@ -329,7 +329,9 @@ Partial closes keep the strategy `closing` with the reduced size; closing again 
   would trade, before the signature is spent and again under the account lock.
 - **Deploy** has no waiting client, so a funded strategy that finds no book keeps its funds and retries on the next watcher
   ticks (`failure_reason` says `NO_LIQUIDITY ... retrying, attempt n`) with **no order sent and no margin moved**; after
-  `MAX_ACTIVATION_ATTEMPTS` it fails and the funding is refunded. Deploy needs the whole target size, like close.
+  `ACTIVATION_GRACE_S` seconds (default 120, measured from when funding completed, so it does not depend on how slow the venue is
+  or how many ticks run) it fails and the funding is refunded. `failure_reason` counts down ("gives up and refunds in 87s").
+  Deploy needs the whole target size, like close.
 
 **Failure rules.**
 - Failed **before anything was traded**: the strategy returns to `active`.
@@ -494,8 +496,16 @@ non-2xx body `{"error", "code"}`. Mutating the API in any of those ways fails th
 `/health` and `/markets` were out of scope in v4, so they follow the original spec: `/health` has version, venue, the
 Hyperliquid network and account margin, the Solana network, funding address, stablecoin mint and the active strategy and
 schedule counts (plus the leverage assertion, reconciliation and unresolved counters); `/markets` lists each market with the
-live Hyperliquid mark and Pyth price. If Cantina needs those two written down as a contract, send it and the tests will
-encode it.
+live Hyperliquid mark and Pyth price.
+Each `/markets` row carries **`status`**, exactly `"active"` or `"coming_soon"` (lowercase; the frontend compares it
+strictly, so a missing or differently-cased value shows as "Coming soon"). It comes from `enabled` in `markets.yaml` (default
+true) and never from live prices, so a slow price feed cannot grey a market out; a market with `enabled: false` is listed as
+`coming_soon` and the API refuses new strategies on it. The frontend's `StrategyMarket` type is `{market_id, symbol, venue_coin, max_leverage, mark_price_usd, pyth_price_usd,
+market_closed, deviation_bps}`, and every row here carries exactly those fields (plus `status` and `price_stale`, which a tolerant
+client ignores). **Prices are never null:** the type is non-nullable, so a failed price read does not become `null` in a row.
+Instead the last good values are served for up to 10 minutes with `price_stale: true` and the reason in `error`; with no usable
+price at all the whole call fails with a 503 `{error, code}` (the underlying code, e.g. `STALE_PRICE`, or `VENUE_UNAVAILABLE`).
+`market_closed` is informational: a closed market is still `active` and still selectable (its last price is used).
 
 ## Known limitations
 

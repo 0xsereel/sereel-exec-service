@@ -20,6 +20,37 @@ def _fail(msg: str):
     raise typer.Exit(1)
 
 
+@strategies_app.command("adjust-ledger")
+def adjust_ledger(strategy_id: str = typer.Argument(..., help="Strategy id"),
+                  realized: str = typer.Option(..., "--realized", help="Signed USD to ADD to realized P&L, e.g. -0.432444"),
+                  reason: str = typer.Option(..., "--reason", help="What happened (20+ characters); it is stored and attested"),
+                  yes: bool = typer.Option(False, "--yes", help="Do not ask for confirmation")):
+    """Operator-only (no API route): book a correction into a live strategy's realized P&L, with a mandatory reason, attested.
+    For known historical errors; the same reason cannot be booked twice on a strategy."""
+    from decimal import Decimal, InvalidOperation
+
+    from app import solana_client as sol
+    from app.strategies import service
+
+    try:
+        delta = Decimal(realized)
+    except InvalidOperation:
+        _fail(f"--realized must be a number, got '{realized}'")
+    init_db()
+    console.print(f"strategy {strategy_id}: realized P&L {delta:+f} USD\n  reason: {reason}")
+    if not yes and not typer.confirm("Book this adjustment?", default=False):
+        _fail("cancelled; nothing booked")
+    try:
+        st, before = service.operator_adjust_ledger(strategy_id, delta, reason)
+    except ServiceError as e:
+        _fail(f"{e.code}: {e.message}")
+    console.print(f"[green]booked[/]: realized P&L {before:f} -> {st.realized_pnl_usd:f}")
+    if st.last_attestation_sig:
+        console.print(f"  attestation (booked_by: operator): {sol.explorer_url(st.last_attestation_sig)}")
+    else:
+        console.print("[yellow]  the attestation could not be posted (check the attest key's SOL); the adjustment IS booked[/]")
+
+
 @strategies_app.command("set-owner")
 def set_owner(strategy_id: str = typer.Argument(..., help="Strategy id"),
               pubkey: str = typer.Option(None, "--pubkey", help="The manager's Sereel Solana wallet"),

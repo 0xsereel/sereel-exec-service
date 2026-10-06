@@ -43,6 +43,15 @@ def fund(api, fakechain, s, amount=127.2, memo=None, sender=SENDER):
     return sig, watcher.watch_once()
 
 
+def age_funding(sid, seconds):
+    """Pretend funding completed `seconds` ago: the deploy retry window is measured from funded_at."""
+    with Session(engine) as db:
+        st = db.get(Strategy, sid)
+        st.funded_at = now() - timedelta(seconds=seconds)
+        db.add(st)
+        db.commit()
+
+
 def rows(model):
     with Session(engine) as s:
         return list(s.exec(select(model)).all())
@@ -386,12 +395,13 @@ def test_a_price_deviation_delays_activation_then_it_succeeds_without_losing_the
     assert get(api, s["id"])["status"] == "active"
 
 
-def test_repeated_activation_failure_ends_failed_with_a_refund_and_an_attestation(api, fakechain, monkeypatch):
-    monkeypatch.setattr(settings, "max_activation_attempts", 2)
+def test_a_deploy_that_cannot_open_within_the_window_ends_failed_with_a_refund_and_an_attestation(api, fakechain):
     s = create(api)
     state.venue.price_override[M] = D("3000")
-    fund(api, fakechain, s)  # attempt 1
-    watcher.watch_once()  # attempt 2 -> fail
+    fund(api, fakechain, s)  # first attempt: retrying
+    assert get(api, s["id"])["status"] == "pending_funding"
+    age_funding(s["id"], settings.activation_grace_s)  # the window has now run out
+    watcher.watch_once()
     a = get(api, s["id"])
     assert a["status"] == "failed" and "PRICE_DEVIATION" in a["failure_reason"]
     assert fakechain.refunds[0][:2] == (SENDER, D("127.2")) and state.venue.position(None, M).size == 0
@@ -402,7 +412,7 @@ def test_repeated_activation_failure_ends_failed_with_a_refund_and_an_attestatio
 
 
 def test_insufficient_margin_fails_the_strategy_with_a_refund(api, fakechain, monkeypatch):
-    monkeypatch.setattr(settings, "max_activation_attempts", 1)
+    monkeypatch.setattr(settings, "activation_grace_s", 0)  # no waiting: fail on the first refusal
     state.venue.funds = D(10)  # the venue account cannot supply the margin
     s = create(api)
     fund(api, fakechain, s)
@@ -410,11 +420,12 @@ def test_insufficient_margin_fails_the_strategy_with_a_refund(api, fakechain, mo
     assert a["status"] == "failed" and "INSUFFICIENT_MARGIN" in a["failure_reason"] and len(fakechain.refunds) == 1
 
 
-def test_no_fill_at_all_retries_and_never_opens_a_phantom_position(api, fakechain, monkeypatch):
-    monkeypatch.setattr(settings, "max_activation_attempts", 2)
+def test_no_fill_at_all_retries_and_never_opens_a_phantom_position(api, fakechain):
     state.venue.fill_fraction = D(0)
     s = create(api)
     fund(api, fakechain, s)
+    assert get(api, s["id"])["status"] == "pending_funding"  # retried, not failed, while the window is open
+    age_funding(s["id"], settings.activation_grace_s)
     watcher.watch_once()
     a = get(api, s["id"])
     assert a["status"] == "failed" and "ORDER_NOT_FILLED" in a["failure_reason"] and a["position"] is None

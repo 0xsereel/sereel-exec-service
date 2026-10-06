@@ -128,21 +128,45 @@ def health():
     return out
 
 
-@app.get("/markets", dependencies=auth)
-def markets():
+# Last good prices per market. The frontend types every price as a non-null number, so a failed read must never become `null` in
+# a row: it serves the last good values (flagged price_stale) for a while, and if there are none the whole call is a clear error.
+_market_cache: dict[str, tuple[float, dict]] = {}
+MARKET_CACHE_MAX_AGE_S = 600
+
+
+def _live_prices(mid: str, m) -> dict:
     from . import pyth
     from .util import num
 
-    rows = []
+    mark = state.venue.mark_price(mid)
+    q = pyth.get_price(m.pyth_feed_id, m.max_staleness_s, symbol=m.symbol)
+    return {"mark_price_usd": num(mark), "pyth_price_usd": num(q.price), "market_closed": bool(q.market_closed),
+            "deviation_bps": num(abs(mark - q.price) / q.price * 10_000)}
+
+
+@app.get("/markets", dependencies=auth)
+def markets():
+    """Markets with live Hyperliquid mark and Pyth price. Every price field is always a number and market_closed always a boolean
+    (the frontend's StrategyMarket type is non-nullable): on a failed read the last good values are served with
+    `price_stale: true` and the reason in `error`; with no usable values at all the call fails with a clear 503 instead."""
+    import time
+
+    rows, failures = [], []
     for mid, m in state.markets.items():
-        row = {"market_id": mid, "symbol": m.symbol, "venue_coin": m.hl_coin, "max_leverage": m.max_leverage,
-               "mark_price_usd": None, "pyth_price_usd": None, "market_closed": None, "deviation_bps": None}
+        row = {"market_id": mid, "symbol": m.symbol, "status": m.status, "venue_coin": m.hl_coin, "max_leverage": m.max_leverage}
         try:
-            row["mark_price_usd"] = num(state.venue.mark_price(mid))
-            q = pyth.get_price(m.pyth_feed_id, m.max_staleness_s, symbol=m.symbol)
-            row["pyth_price_usd"], row["market_closed"] = num(q.price), q.market_closed
-            row["deviation_bps"] = num(abs(state.venue.mark_price(mid) - q.price) / q.price * 10_000)
-        except Exception as e:
-            row["error"] = getattr(e, "message", str(e))
+            prices = _live_prices(mid, m)
+            _market_cache[mid] = (time.time(), prices)
+            row.update(prices, price_stale=False)
+        except Exception as e:  # noqa: BLE001
+            failures.append(e)
+            cached = _market_cache.get(mid)
+            if cached is None or time.time() - cached[0] > MARKET_CACHE_MAX_AGE_S:
+                continue  # nothing trustworthy to show for this market
+            row.update(cached[1], price_stale=True, error=getattr(e, "message", str(e)))
         rows.append(row)
+    if not rows and failures:
+        e = failures[0]
+        raise ServiceError(getattr(e, "code", "VENUE_UNAVAILABLE"), f"no market price is available right now: "
+                           f"{getattr(e, 'message', str(e))}", getattr(e, "status", 503) if isinstance(e, ServiceError) else 503)
     return rows

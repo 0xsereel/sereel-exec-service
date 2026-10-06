@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     rebalance_band_pct: Decimal = Decimal(5)
     max_price_deviation_bps: Decimal = Decimal(200)
     ioc_max_retries: int = 3
-    max_activation_attempts: int = 12  # watcher ticks (5s) to keep retrying a funded strategy's first order before refunding
+    activation_grace_s: int = 120  # how long after funding completes a deploy that cannot proceed is retried before it fails and refunds
     rebalance_tolerance_pct: Decimal = Decimal(2)  # create: expected_amount_usd may be this far below the computed requirement
     mm_min_size: Decimal = Decimal("0.02")  # market maker per-level order size bounds (coin units)
     mm_max_size: Decimal = Decimal("0.05")
@@ -100,6 +100,13 @@ class Market(BaseModel):
     pyth_feed_id: str
     max_leverage: int = 3
     max_staleness_s: int = 30
+    enabled: bool = True  # false lists the market as "coming_soon" and refuses new strategies on it
+
+    @property
+    def status(self) -> str:
+        """The frontend's StrategyMarket.status: exactly "active" or "coming_soon" (a strict string comparison on its side).
+        It comes from configuration only, never from live prices: a slow Pyth or Hyperliquid must not grey a market out."""
+        return "active" if self.enabled else "coming_soon"
 
 
 def load_markets(path: Path | None = None) -> dict[str, Market]:

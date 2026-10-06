@@ -62,7 +62,8 @@ class Strategy(SQLModel, table=True):
     received_amount_usd: Decimal | None = nullable_money()
     expires_at: datetime
     deploy_signature: str | None = None  # inbound transfer that completed the funding
-    activation_attempts: int = 0  # funded, but the first order has not gone through yet
+    activation_attempts: int = 0  # funded, but the first order has not gone through yet (informational)
+    funded_at: datetime | None = None  # when funding completed: the deploy retry window is measured from here, in time not attempts
 
     # per-strategy ledger on the shared venue account
     margin_usd: Decimal = money()  # credited margin (deposits + excess)

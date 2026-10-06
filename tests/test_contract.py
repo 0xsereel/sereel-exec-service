@@ -261,3 +261,4 @@ def test_markets_lists_markets_with_live_mark_and_pyth_price(api):
     m = rows[0]
     assert m["market_id"] == M and m["symbol"] == "XAU" and isinstance(m["mark_price_usd"], float) and isinstance(m["pyth_price_usd"], float)
     assert m["market_closed"] is False and m["max_leverage"] == 3
+    assert m["status"] == "active"  # the frontend compares this strictly: anything else renders "Coming soon"

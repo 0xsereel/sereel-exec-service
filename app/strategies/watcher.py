@@ -132,6 +132,8 @@ def process_signature(sig: str, funding: str) -> str | None:
             st.deploy_signature, st.updated_at = sig, now()
             s.add(st)
             funded = st.received_amount_usd >= st.expected_amount_usd
+            if funded and st.funded_at is None:
+                st.funded_at = now()  # the deploy retry window starts here, once; later transfers never move it
         else:
             dep = s.get(StrategyDeposit, ref)
             dep.received_amount_usd = (dep.received_amount_usd or Decimal(0)) + amount
