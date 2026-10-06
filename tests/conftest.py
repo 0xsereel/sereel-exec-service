@@ -59,7 +59,10 @@ class FakeChain:
         self.mint = str(Keypair().pubkey())
         monkeypatch.setattr(settings, "stablecoin_mint", self.mint)
         self.funding = str(self.keys["funding"].pubkey())
+        self.ata = str(sol.ata(self.funding))  # the funding wallet's token account for the stablecoin
         self.order, self.txs = [], {}
+        self.touches: dict[str, set[str]] = {}  # signature -> the accounts that transaction references
+        self.queried: set[str] = set()  # every address a signature listing was requested for
         self.refunds, self.memos = [], []
         self.accounts: dict[str, dict] = {}  # address -> getAccountInfo value (for Squads reads)
         self.rpc_calls: list[str] = []
@@ -75,9 +78,12 @@ class FakeChain:
         monkeypatch.setattr(sol, "post_memo", self._memo)
         monkeypatch.setattr(sol, "pay", self._pay)
 
-    def deposit(self, sender: str, amount, memo: str | None = None) -> str:
+    def deposit(self, sender: str, amount, memo: str | None = None, creates_ata: bool = False) -> str:
+        """An inbound transfer. Like a real plain SPL transfer it references the funding TOKEN ACCOUNT but not the owner wallet;
+        only a transfer that also creates the token account (creates_ata) references the wallet too."""
         self.n += 1
         sig = f"dep{self.n}"
+        self.touches[sig] = {self.ata, sender, "sender-token-account", "mint", "token-program"} | ({self.funding} if creates_ata else set())
         bal = lambda rows: [{"mint": self.mint, "owner": o, "uiTokenAmount": {"uiAmountString": str(a)}} for o, a in rows]
         ixs = [{"program": "spl-token", "parsed": {}}] + ([{"program": "spl-memo", "parsed": memo}] if memo else [])
         self.txs[sig] = {"meta": {"err": None, "innerInstructions": [],
@@ -95,11 +101,18 @@ class FakeChain:
             return {"value": self.accounts.get(params[0])}
         assert method == "getSignaturesForAddress", method
         limit = params[1].get("limit", 1000)
-        return [{"signature": s, "err": None} for s in reversed(self.order)][:limit]
+        return [{"signature": s, "err": None} for s in reversed(self._listed(params[0]))][:limit]
+
+    def _listed(self, address):
+        """What a real RPC lists for an address: only the transactions that reference it. (Signatures added without an explicit
+        account list are treated as touching the token account.)"""
+        self.queried.add(address)
+        return [s for s in self.order if address in self.touches.get(s, {self.ata})]
 
     def _since(self, address, until, limit=200, max_pages=20):
-        i = self.order.index(until) + 1 if until in self.order else 0
-        return list(self.order[i:])
+        listed = self._listed(address)
+        i = listed.index(until) + 1 if until in listed else 0
+        return list(listed[i:])
 
     def _get_tx(self, sig, commitment="finalized"):
         if sig in self.fetch_errors:

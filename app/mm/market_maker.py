@@ -38,6 +38,8 @@ class MMConfig:
     levels: int = 3
     size: Decimal = Decimal("0.03")  # coin units per level, bounded by MM_MIN_SIZE..MM_MAX_SIZE
     refresh_s: float = 5
+    requote_bps: Decimal = Decimal(3)  # leave resting quotes alone while each is within this of where it would be quoted now
+    rate_limit_backoff_s: float = 300  # pause after Hyperliquid says the account is out of actions
     center: str = "oracle"  # oracle | pyth | mark
     flatten_wait_s: float = 60  # on startup: how long to wait for the book to let leftover inventory be flattened
     max_inventory: Decimal | None = None  # coin units; default levels * size
@@ -95,6 +97,9 @@ class MarketMaker:
         self.mode = connect_with_retries("reading the account mode", lambda: account_mode(self.info, self.addr))
         use_request_timeouts(self.info, self.exchange)
         self._stop = False
+
+    _paused_until = 0.0  # class defaults so a maker built without __init__ (tests) still works
+    requests = 0  # cancel + order actions sent this run
 
     # -- market data ----------------------------------------------------------
     def ctx(self) -> dict:
@@ -164,17 +169,57 @@ class MarketMaker:
         if orders:
             self.exchange.bulk_cancel([{"coin": o["coin"], "oid": o["oid"]} for o in orders])
 
+    def _resting_matches(self, resting: list[dict], wanted: list[dict]) -> bool:
+        """True if the resting orders are the wanted quotes, each price within requote_bps (so nothing needs sending)."""
+        if len(resting) != len(wanted):
+            return False
+        tol = self.cfg.requote_bps / 10_000
+        for is_buy in (True, False):
+            have = sorted(Decimal(o["limitPx"]) for o in resting if (o["side"] == "B") == is_buy)
+            want = sorted(Decimal(str(w["limit_px"])) for w in wanted if w["is_buy"] == is_buy)
+            if len(have) != len(want) or any(abs(h - w) > w * tol for h, w in zip(have, want)):
+                return False
+        sizes = {Decimal(str(w["sz"])) for w in wanted}
+        return all(Decimal(o["sz"]) in sizes for o in resting)
+
     def tick(self) -> None:
-        """Cancel and replace all quotes around the (skewed) center."""
-        self.cancel_all()
+        """Keep quotes around the (skewed) center, sending actions only when they have drifted: every cancel and every order
+        counts against Hyperliquid's per-account action quota (10,000 + cumulative USDC traded), so a blind 5s refresh burns it."""
+        if time.time() < self._paused_until:
+            return
         bid, ask = self.best_bid_ask()
-        res = self.exchange.bulk_orders(self.quotes(self.center_price(), self.inventory(), bid, ask))
+        wanted = self.quotes(self.center_price(), self.inventory(), bid, ask)
+        resting = self.open_orders()
+        if resting and self._resting_matches(resting, wanted):
+            return
+        try:
+            if resting:
+                self.exchange.bulk_cancel([{"coin": o["coin"], "oid": o["oid"]} for o in resting])
+                self.requests += 1
+            res = self.exchange.bulk_orders(wanted)
+            self.requests += 1
+        except Exception as e:
+            if self._rate_limited(e):
+                return
+            raise
         if res.get("status") != "ok":
-            log.warning("quote refresh failed: %s", res)
+            if not self._rate_limited(res):
+                log.warning("quote refresh failed: %s", res)
             return
         errs = [s["error"] for s in res["response"]["data"]["statuses"] if "error" in s]
         if errs:
-            log.warning("%d quote(s) rejected: %s", len(errs), errs[0])
+            if not self._rate_limited(errs[0]):
+                log.warning("%d quote(s) rejected: %s", len(errs), errs[0])
+
+    def _rate_limited(self, err) -> bool:
+        if "too many cumulative requests" not in str(err).lower():
+            return False
+        self._paused_until = time.time() + self.cfg.rate_limit_backoff_s
+        log.error("Hyperliquid has rate-limited the market maker's account (%s). Quoting is paused for %ds; strategies cannot "
+                  "deploy without liquidity. The limit is 10,000 requests + 1 per USDC traded: about %d requests were sent this "
+                  "run. Recover by trading taker volume on the MM account (about $1 of volume per request over the limit), or "
+                  "point HL_MM_* at a fresh account.", str(err)[:160], self.cfg.rate_limit_backoff_s, self.requests)
+        return True
 
     # -- inventory flatten ----------------------------------------------------
     def flatten(self, attempts: int = 3) -> Decimal:

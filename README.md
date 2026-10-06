@@ -108,6 +108,12 @@ have a counterparty on the thin testnet book. It refuses to start unless `HL_API
 (independent of `ALLOW_MAINNET`).
 
 - **Sizes:** 0.02-0.05 per level (`MM_MIN_SIZE` / `MM_MAX_SIZE`), 3 levels per side by default.
+- **Action quota:** Hyperliquid allows an account 10,000 requests plus 1 per USDC of volume it has traded. The maker checks
+  every 5s but only sends a cancel + order batch when a resting quote has drifted more than `--requote-bps` (default 3)
+  from where it would be quoted now, or a level was filled or inventory changed the skew. If the venue still answers
+  `Too many cumulative requests`, the maker logs one error, pauses quoting for 5 minutes, and then retries. While it is
+  paused nothing rests on the book, so strategy deploys fail with `NO_LIQUIDITY`. Recover by trading taker volume on the MM
+  account (about $1 per request over the limit) or by pointing `HL_MM_*` at a fresh account.
 - **Center:** the Hyperliquid **oracle** price by default (`--center oracle|pyth|mark`). Testnet marks drift from the
   oracle (observed: mark 4211 vs oracle 4160); centering on the oracle pulls the mark back. A quote that would
   cross the book is sent GTC and takes the stale liquidity; a quote that rests safely is post-only (ALO). In a live

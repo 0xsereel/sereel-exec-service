@@ -24,13 +24,21 @@ CURSOR = "funding"
 STALE_CLAIM_S = 120
 
 
+def watch_address() -> str:
+    """The address whose transaction list is read: the funding wallet's TOKEN ACCOUNT, not the wallet. A plain SPL transfer
+    references the destination token account but not its owner, so listing the wallet misses every deposit into an account
+    that already exists (only a transfer that also creates the account mentions the wallet). Every transfer into the token
+    account references it, including the one that creates it."""
+    return str(sol.ata(service.funding_address()))
+
+
 def ensure_cursor() -> None:
     """First ever start: begin at the newest existing signature, so history that predates the service (old test
     transfers, SOL airdrops) is not mistaken for deposits and refunded."""
     with Session(engine) as s:
         if s.get(WatcherCursor, CURSOR):
             return
-        page = sol.rpc("getSignaturesForAddress", [service.funding_address(), {"commitment": "finalized", "limit": 1}])
+        page = sol.rpc("getSignaturesForAddress", [watch_address(), {"commitment": "finalized", "limit": 1}])
         s.add(WatcherCursor(name=CURSOR, last_signature=page[0]["signature"] if page else None))
         s.commit()
         log.info("deposit watcher starts after %s", page[0]["signature"] if page else "the beginning of time")
@@ -180,7 +188,7 @@ def watch_once() -> dict:
     with Session(engine) as s:
         cursor = s.get(WatcherCursor, CURSOR).last_signature
     handled, attempted = 0, set()
-    for sig in sol.finalized_signatures_since(funding, cursor):
+    for sig in sol.finalized_signatures_since(watch_address(), cursor):
         if (sid := process_signature(sig, funding)):  # an error stops the tick here and the cursor stays put: it is retried
             attempted.add(sid)
         _set_cursor(sig)

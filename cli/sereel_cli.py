@@ -124,7 +124,7 @@ def _mm_profile(market: str):
     return ROOT / "profiles" / f"mm-{market}.yaml"
 
 
-def _build_mm(market: str, spread_bps=None, levels=None, size=None, center=None, max_inventory=None, flatten_wait=60.0,
+def _build_mm(market: str, spread_bps=None, levels=None, size=None, center=None, max_inventory=None, flatten_wait=60.0, requote_bps=3.0,
               save=True, interactive=True):
     """Resolve flags > saved profile > prompt (or defaults when not interactive) into a MarketMaker. Raises ServiceError."""
     from app.mm.market_maker import MarketMaker, MMConfig, assert_testnet
@@ -151,6 +151,7 @@ def _build_mm(market: str, spread_bps=None, levels=None, size=None, center=None,
         size=Decimal(str(pick(size, "size", "Size per level (coin units)"))),
         center=str(pick(center, "center", "Center on (oracle/pyth/mark)")),
         flatten_wait_s=flatten_wait,
+        requote_bps=Decimal(str(requote_bps)),
         max_inventory=Decimal(str(max_inventory)) if max_inventory is not None
         else (Decimal(str(saved["max_inventory"])) if saved.get("max_inventory") is not None else None),
     )
@@ -215,11 +216,12 @@ def mm_run(
     center: str = typer.Option(None, "--center", help="oracle | pyth | mark"),
     max_inventory: float = typer.Option(None, "--max-inventory"),
     flatten_wait: float = typer.Option(60, "--flatten-wait", help="Seconds to wait on startup for the book to let leftover inventory be flattened"),
+    requote_bps: float = typer.Option(3.0, "--requote-bps", help="Leave resting quotes alone while within this many bps of target (saves Hyperliquid's action quota)"),
     save: bool = typer.Option(True, help="Save these settings as profiles/mm-<market>.yaml"),
 ):
     """Run the testnet market maker. Refuses unless HL_API_URL is testnet. Ctrl-C / `mm stop` cancels and flattens."""
     try:
-        mm = _build_mm(market, spread_bps, levels, size, center, max_inventory, flatten_wait, save)
+        mm = _build_mm(market, spread_bps, levels, size, center, max_inventory, flatten_wait, requote_bps, save)
     except ServiceError as e:
         _fail(f"{e.code}: {e.message}")
     signal.signal(signal.SIGTERM, lambda *_: mm.stop())  # `mm stop` -> graceful shutdown (cancel + reduce-only flatten)
