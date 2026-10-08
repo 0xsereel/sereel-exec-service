@@ -572,6 +572,10 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `WITHDRAW_NOT_AUTHORIZED` | 503 | withdrawing needs the master key, which is not configured |
 | `WITHDRAW_FAILED` | 400 | the bridge rejected the withdrawal |
 | `PAYMENT_FAILED` | 502 | the Solana payout failed |
+| `AGENT_DISABLED` | 503 | the AI agent is switched off (AGENT_ENABLED=false) |
+| `LLM_UNAVAILABLE` | 503 | the language model could not be reached or is not configured; the chat cannot respond (use the manual form) |
+| `CHAT_SESSION_EXPIRED` | 410 | the chat session is older than 24 hours; start a new one |
+| `CHAT_LIMIT_REACHED` | 429 | too many chat messages: the session reached its message cap or the owner is sending too fast |
 | `MM_MAINNET_REFUSED` | n/a | the market maker refuses to run unless HL_API_URL is testnet |
 | `MM_SIZE_OUT_OF_RANGE` | n/a | market maker order size outside MM_MIN_SIZE..MM_MAX_SIZE |
 | `MM_BAD_CONFIG` | n/a | invalid market maker settings |

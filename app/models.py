@@ -155,6 +155,23 @@ class PriceSample(SQLModel, table=True):
     ts: datetime = Field(default_factory=now, index=True)
 
 
+class ChatSession(SQLModel, table=True):
+    """A setup-assistant conversation. Holds the validated slots, the user/assistant text and the owner-supplied context; no
+    secrets and nothing about other owners."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    owner_pubkey: str = Field(index=True)
+    strategy_id: str | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=now)
+    updated_at: datetime = Field(default_factory=now)
+    expires_at: datetime = Field(index=True)
+    user_messages: int = 0
+    messages: list = Field(default_factory=list, sa_column=Column(JSON, nullable=False))  # [{role, content}], user/assistant only
+    slots: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    context: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    recommendation: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    status: str = "collecting"  # collecting | ready | unsupported
+
+
 class Withdrawal(SQLModel, table=True):
     """Return-excess and close share this state machine."""
     id: str = Field(default_factory=new_id, primary_key=True)

@@ -86,9 +86,11 @@ async def _unexpected(_: Request, exc: Exception):
 
 from .payments.router import router as payments_router  # noqa: E402
 from .strategies.router import router as strategies_router  # noqa: E402
+from .ai.router import router as agent_router  # noqa: E402
 
 app.include_router(payments_router)
 app.include_router(strategies_router)
+app.include_router(agent_router)
 
 
 @app.get("/health")

@@ -119,6 +119,34 @@ def _owned(st: Strategy | None, org: str) -> Strategy:
 
 # ---- create / cancel / top-up ----------------------------------------------
 
+def quote_strategy(m, exposure: Decimal, hedge_ratio_bps: int, leverage: int,
+                   expected_amount_usd: Decimal | None = None) -> tuple[Decimal, Decimal, Decimal]:
+    """(hedge size, mark, required margin) for a strategy, applying the venue's minimum order and, when an amount is given, the
+    margin floor. One function for create and for the setup assistant's draft, so a draft can never be a strategy that create
+    would refuse."""
+    size = exposure * Decimal(hedge_ratio_bps) / 10_000
+    mark = venue().mark_price(m.market_id)
+    notional, minimum = size * mark, settings.min_order_usd * Decimal("1.05")  # 5% cushion for the mark moving before the order
+    if 0 < size and notional < minimum:
+        need = (minimum / mark / (Decimal(hedge_ratio_bps) / 10_000)).quantize(Decimal("0.0001"), rounding="ROUND_UP")
+        unit = m.unit
+        raise _bad(f"the hedge would be {size} {unit} (about ${notional:.2f}), below the venue's ${settings.min_order_usd} minimum order. "
+                   f"Raise target_exposure_units to at least {need.normalize():f} {unit} at hedge_ratio_bps {hedge_ratio_bps} "
+                   f"(about ${required_margin(need * Decimal(hedge_ratio_bps) / 10_000, mark, leverage):.2f} of margin)")
+    required = required_margin(size, mark, leverage)
+    floor = required * (1 - settings.rebalance_tolerance_pct / 100)
+    if expected_amount_usd is not None and expected_amount_usd < floor:
+        raise _bad(f"expected_amount_usd {expected_amount_usd} is below the required margin {required} "
+                   f"(a {size} short at {leverage}x plus {settings.margin_buffer_pct}% buffer)")
+    return size, mark, required
+
+
+def short_liquidation_price(cash: Decimal, entry: Decimal, size: Decimal, rate: Decimal) -> Decimal:
+    """Price at which a short of `size` opened at `entry`, backed by `cash`, reaches maintenance (the position_out formula)."""
+    return (cash + entry * size) / (size * (1 + rate))
+
+
+
 def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> Strategy:
     m = market(body.market_id)
     if body.target_exposure_units <= 0:
@@ -138,20 +166,7 @@ def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> St
     owner_pubkey, owner_multisig = validate_owner(body.owner_pubkey, body.owner_multisig,
                                                   required=not settings.auth_bypass_active)
 
-    size = body.target_exposure_units * Decimal(body.hedge_ratio_bps) / 10_000
-    mark = venue().mark_price(body.market_id)
-    notional, minimum = size * mark, settings.min_order_usd * Decimal("1.05")  # 5% cushion for the mark moving before the order
-    if 0 < size and notional < minimum:
-        need = (minimum / mark / (Decimal(body.hedge_ratio_bps) / 10_000)).quantize(Decimal("0.0001"), rounding="ROUND_UP")
-        unit = m.unit
-        raise _bad(f"the hedge would be {size} {unit} (about ${notional:.2f}), below the venue's ${settings.min_order_usd} minimum order. "
-                   f"Raise target_exposure_units to at least {need.normalize():f} {unit} at hedge_ratio_bps {body.hedge_ratio_bps} "
-                   f"(about ${required_margin(need * Decimal(body.hedge_ratio_bps) / 10_000, mark, body.leverage):.2f} of margin)")
-    required = required_margin(size, mark, body.leverage)
-    floor = required * (1 - settings.rebalance_tolerance_pct / 100)
-    if body.expected_amount_usd < floor:
-        raise _bad(f"expected_amount_usd {body.expected_amount_usd} is below the required margin {required} "
-                   f"(a {size} short at {body.leverage}x plus {settings.margin_buffer_pct}% buffer)")
+    size, mark, required = quote_strategy(m, body.target_exposure_units, body.hedge_ratio_bps, body.leverage, body.expected_amount_usd)
     multisig = sol.is_multisig_address(body.registered_sender_address)  # a Squads vault is an off-curve PDA
     with Session(engine) as s:
         st = Strategy(fund_id=body.fund_id, fund_name=body.fund_name or body.fund_id, market_id=m.market_id,
@@ -1055,7 +1070,7 @@ def position_out(st: Strategy, mark: Decimal | None) -> dict | None:
     health = max(0, min(10_000, int(10_000 * (equity - maintenance) / equity))) if equity > 0 else 0
     liq = None
     if magnitude:
-        liq = (cash + st.entry_px * magnitude) / (magnitude * (1 + rate)) if size < 0 \
+        liq = short_liquidation_price(cash, st.entry_px, magnitude, rate) if size < 0 \
             else (st.entry_px * magnitude - cash) / (magnitude * (1 - rate))
     venue_liq = venue_liquidation_for(st.market_id) if magnitude else None
     if liq is not None and venue_liq is not None:

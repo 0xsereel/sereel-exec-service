@@ -37,6 +37,11 @@ CODES: dict[str, tuple[int, str]] = {
     "WITHDRAW_FAILED": (400, "the bridge rejected the withdrawal"),
     # --- payments ---
     "PAYMENT_FAILED": (502, "the Solana payout failed"),
+    # --- AI agent ---
+    "AGENT_DISABLED": (503, "the AI agent is switched off (AGENT_ENABLED=false)"),
+    "LLM_UNAVAILABLE": (503, "the language model could not be reached or is not configured; the chat cannot respond (use the manual form)"),
+    "CHAT_SESSION_EXPIRED": (410, "the chat session is older than 24 hours; start a new one"),
+    "CHAT_LIMIT_REACHED": (429, "too many chat messages: the session reached its message cap or the owner is sending too fast"),
     # --- market maker (CLI only; never returned by the API) ---
     "MM_MAINNET_REFUSED": (0, "the market maker refuses to run unless HL_API_URL is testnet"),
     "MM_SIZE_OUT_OF_RANGE": (0, "market maker order size outside MM_MIN_SIZE..MM_MAX_SIZE"),

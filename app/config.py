@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     agent_interval_s: int = 60
     agent_act_threshold: Decimal = Decimal("0.80")
     agent_suggest_threshold: Decimal = Decimal("0.50")
+    chat_session_ttl_h: int = 24
+    chat_max_messages: int = 30  # user messages per session
+    chat_max_chars: int = 4000  # per message
+    chat_rate_per_min: int = 12  # per owner
     signals_source_network: str = "mainnet"  # read-only market signals; execution stays on HL_API_URL (testnet)
     signals_hl_url: str = "https://api.hyperliquid.xyz"  # info reads ONLY: never an Exchange, never a key
     jev_base_url: str = "https://gateway.ngrok.ai/v1"
