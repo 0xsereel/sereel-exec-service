@@ -1,0 +1,15 @@
+# Scheduled events that move gold. ONLY entries read directly from the issuing agency's own schedule page on `verified_on`;
+# each carries its source_url. Add an event only after checking that page; never from memory or a third-party calendar.
+# FOMC: the decision is published on the second meeting day (the Fed's page lists the two-day range; no time is entered here
+# because the page read did not state one, so the whole day in America/New_York counts as the event window).
+# CPI: BLS lists the release at 08:30 AM (Eastern).
+- {kind: fomc, name: "FOMC meeting, decision day", date: "2026-10-28", time: null, tz: America/New_York,
+   source_url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm", verified_on: "2026-10-08", note: "meeting Oct 27-28"}
+- {kind: fomc, name: "FOMC meeting, decision day (with Summary of Economic Projections)", date: "2026-12-09", time: null, tz: America/New_York,
+   source_url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm", verified_on: "2026-10-08", note: "meeting Dec 8-9"}
+- {kind: cpi, name: "CPI release (September 2026 data)", date: "2026-10-14", time: "08:30", tz: America/New_York,
+   source_url: "https://www.bls.gov/schedule/news_release/cpi.htm", verified_on: "2026-10-08"}
+- {kind: cpi, name: "CPI release (October 2026 data)", date: "2026-11-10", time: "08:30", tz: America/New_York,
+   source_url: "https://www.bls.gov/schedule/news_release/cpi.htm", verified_on: "2026-10-08"}
+- {kind: cpi, name: "CPI release (November 2026 data)", date: "2026-12-10", time: "08:30", tz: America/New_York,
+   source_url: "https://www.bls.gov/schedule/news_release/cpi.htm", verified_on: "2026-10-08"}

@@ -18,7 +18,7 @@ def test_a_hedge_under_the_venue_minimum_is_refused_before_anything_is_stored(ap
     r = post(api, target_exposure_units=0.002, hedge_ratio_bps=10000, expected_amount_usd=5)  # an $8 order
     assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST" and set(r.json()) == {"error", "code"}
     e = r.json()["error"]
-    assert "below the venue's $10 minimum order" in e and "about $8.00" in e and "at least 0.0027" in e
+    assert "below the venue's $10 minimum order" in e and "about $8.00" in e and "at least 0.0027 oz" in e and "0.002 oz" in e
     assert len(api.get("/strategies").json()) == before
 
 

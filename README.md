@@ -585,3 +585,38 @@ Notes:
   the demo works outside gold trading hours. `STALE_PRICE` therefore means "the market is open but the price is old,
   or Pyth is unreachable". The `PRICE_DEVIATION` check still applies against that last price.
 - `UNKNOWN_MARKET` is 404 from the venue lookup and 400 when a request names an unknown market in its body.
+
+## AI agent (Step 1: signals)
+
+The AI layer only ever reads and proposes; no model can move money. Step 1 is the data layer and the Jev client.
+
+| Piece | Job |
+|---|---|
+| `app/ai/state.py` | one deterministic snapshot of the market (and optionally one strategy); its text and SHA-256 `state_hash` are what Jev sees |
+| `app/ai/jev.py` | Jev through the ngrok AI Gateway: yes/no probabilities for a fixed question set |
+| `app/ai/rules_signals.py` | the same questions answered from thresholds when Jev is unconfigured or down (`signals_source: "rules"`) |
+| `app/ai/hl_readonly.py` | read-only Hyperliquid `info` calls; cannot sign, cannot trade |
+
+- **Signals vs execution network.** Market signals are read from Hyperliquid **mainnet** (`SIGNALS_HL_URL`, info only) because testnet
+  gold has thin books and ~0% funding; every order still goes to `HL_API_URL` (testnet). Each snapshot says which it used
+  (`signals_network`, `execution_network`). If mainnet reads fail it falls back to testnet and sets `degraded: true`.
+- **Sources in the snapshot:** Pyth price, confidence, publish time, market-open flag, and 1h/24h/7d change (Hermes historical
+  endpoint); Hyperliquid mark, oracle, hourly and annualized funding, open interest, spread and depth within 0.5%, 1h/24h change and
+  realized volatility (24h, 7d) from hourly candles; the execution testnet's mark and depth; the other HIP-3 gold markets; and a
+  calendar of FOMC and CPI events. Anything that cannot be read appears under `[unavailable]` with the reason, never silently dropped
+  and never guessed. `price_samples` (one row per source per minute, kept 14 days) backs volatility if candles are down.
+- **Calendar.** `data/events.yaml` lists only events read from federalreserve.gov or bls.gov, each with its `source_url` and the date it
+  was verified. FOMC entries are the decision day (the Fed's page gives the meeting range; no time was stated, so the whole day in
+  New York counts); CPI is 08:30 Eastern. A test requires a source URL on every entry.
+- **Jev.** `POST {JEV_BASE_URL}/systemone` with `{model, state, questions}`; each question is type `noul`; the answer is
+  `answers.<name>.noul` in 0..1. The gateway documents two key headers; `JEV_AUTH_HEADER=auto` tries `Authorization: Bearer` and, on a
+  401, `x-api-key`, and `sereel agent signals` prints which one worked. Timeout 10 s, one retry; the key is never logged (model,
+  latency and token counts are).
+- **Questions** live in `app/ai/questions.py` (`QUESTION_SET_VERSION`, recorded with every decision): `needs_top_up_soon`,
+  `should_rebalance`, `abnormal_price_move`, `venue_price_divergence`, `liquidity_sufficient`, `excess_margin_safe_to_return`,
+  `high_impact_event_soon` ("Major economic event soon"), and for setup `volatility_elevated`, `funding_favors_shorts`,
+  `liquidity_sufficient_for_size`. "Margin health" in agent rules means **equity / maintenance margin** (top up below 1.5), not the
+  UI's `margin_health_bps`.
+- **Not included:** PAXG/Oro on Solana via Jupiter (no mint or endpoint could be confirmed, and a guessed mint would price the wrong token).
+- **Try it:** `sereel agent signals` (market only) or `sereel agent signals --strategy <id>` (needs `sereel serve` running).
+

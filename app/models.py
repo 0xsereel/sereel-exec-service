@@ -146,6 +146,15 @@ class PnlSnapshot(SQLModel, table=True):
     cause: str = "tick"  # tick | action name
 
 
+class PriceSample(SQLModel, table=True):
+    """One price reading per source per minute; the volatility fallback when candle reads fail."""
+    id: int | None = Field(default=None, primary_key=True)
+    market_id: str = Field(index=True)
+    source: str = Field(index=True)  # pyth | hl_signals
+    price: Decimal = money()
+    ts: datetime = Field(default_factory=now, index=True)
+
+
 class Withdrawal(SQLModel, table=True):
     """Return-excess and close share this state machine."""
     id: str = Field(default_factory=new_id, primary_key=True)

@@ -12,6 +12,7 @@ from app.config import ROOT, load_markets, settings
 from app.errors import ServiceError
 
 from . import setup
+from .agent import agent_app
 from .payouts import payouts_app
 from .strategies import strategies_app
 
@@ -20,6 +21,7 @@ mm_app = typer.Typer(help="Testnet market maker", no_args_is_help=True)
 app.add_typer(mm_app, name="mm")
 app.add_typer(payouts_app, name="payouts")
 app.add_typer(strategies_app, name="strategies")
+app.add_typer(agent_app, name="agent")
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 FAUCET = "https://faucet.solana.com"

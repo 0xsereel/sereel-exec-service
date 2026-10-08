@@ -143,8 +143,9 @@ def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> St
     notional, minimum = size * mark, settings.min_order_usd * Decimal("1.05")  # 5% cushion for the mark moving before the order
     if 0 < size and notional < minimum:
         need = (minimum / mark / (Decimal(body.hedge_ratio_bps) / 10_000)).quantize(Decimal("0.0001"), rounding="ROUND_UP")
-        raise _bad(f"the hedge would be {size} units (about ${notional:.2f}), below the venue's ${settings.min_order_usd} minimum order. "
-                   f"Raise target_exposure_units to at least {need} at hedge_ratio_bps {body.hedge_ratio_bps} "
+        unit = m.unit
+        raise _bad(f"the hedge would be {size} {unit} (about ${notional:.2f}), below the venue's ${settings.min_order_usd} minimum order. "
+                   f"Raise target_exposure_units to at least {need.normalize():f} {unit} at hedge_ratio_bps {body.hedge_ratio_bps} "
                    f"(about ${required_margin(need * Decimal(body.hedge_ratio_bps) / 10_000, mark, body.leverage):.2f} of margin)")
     required = required_margin(size, mark, body.leverage)
     floor = required * (1 - settings.rebalance_tolerance_pct / 100)
@@ -773,13 +774,14 @@ def require_order_viable(st: Strategy, target_signed: Decimal, mark: Decimal, wh
     a trade worth less than the venue's minimum order (a full close to zero is exempt: it only reduces) and, when it grows
     the short, one the strategy's own cash cannot margin. Nothing is sent and no nonce is burned."""
     delta = target_signed - st.size
+    unit = state.markets[st.market_id].unit if st.market_id in state.markets else "units"
     if delta == 0 or target_signed == 0:
         return
     notional, minimum = abs(delta) * mark, settings.min_order_usd * Decimal("1.05")  # cushion: the mark moves before the order
     if notional < minimum:
         need = (minimum / mark).quantize(Decimal("0.0001"), rounding="ROUND_UP")
-        raise _bad(f"{what} would trade {abs(delta).normalize():f} units (about ${notional:.2f}), below the venue's "
-                   f"${settings.min_order_usd} minimum order. Nothing was sent. A change of at least {need} units is needed; "
+        raise _bad(f"{what} would trade {abs(delta).normalize():f} {unit} (about ${notional:.2f}), below the venue's "
+                   f"${settings.min_order_usd} minimum order. Nothing was sent. A change of at least {need.normalize():f} {unit} is needed; "
                    f"make a larger change or leave the target where it is")
     if check_margin and abs(target_signed) > abs(st.size):
         cash = st.margin_usd + st.realized_pnl_usd + st.funding_usd - st.fees_usd

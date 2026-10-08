@@ -25,8 +25,8 @@ def test_a_forced_rebalance_under_the_venue_minimum_is_refused_and_the_signature
     r, body = rebalance(api, s["id"], force=True)
     assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST" and set(r.json()) == {"error", "code"}
     e = r.json()["error"]
-    assert "this rebalance would trade 0.003 units (about $7.95)" in e and "below the venue's $10 minimum order" in e
-    assert "Nothing was sent" in e and "at least 0.004" in e
+    assert "this rebalance would trade 0.003 oz (about $7.95)" in e and "below the venue's $10 minimum order" in e
+    assert "Nothing was sent" in e and "at least 0.004 oz is needed" in e and "units" not in e
     assert len(state.venue.orders) == orders and nonces() == used  # nothing sent, nonce not burned
     assert get(api, s["id"])["position"]["size_units"] == 0.12
 
@@ -54,7 +54,7 @@ def test_an_edit_whose_rebalance_could_never_trade_is_refused_and_stores_nothing
     used = nonces()
     r, _ = patch(api, s["id"], {"hedge_ratio_bps": "6700"})  # target 0.0335: 11.7% out of band, a 0.0035 trade = $9.28
     assert r.status_code == 400 and r.json()["code"] == "BAD_REQUEST" and set(r.json()) == {"error", "code"}
-    assert "moving to this target would trade 0.0035 units (about $9.28)" in r.json()["error"]
+    assert "moving to this target would trade 0.0035 oz (about $9.28)" in r.json()["error"]
     assert "Nothing was sent" in r.json()["error"]
     assert get(api, s["id"])["hedge_ratio_bps"] == 6000 and nonces() == used  # nothing stored, nonce kept
 

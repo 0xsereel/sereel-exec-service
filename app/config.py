@@ -45,6 +45,24 @@ class Settings(BaseSettings):
     intent_ttl_seconds: int = 3600
     intent_ttl_multisig_seconds: int = 7 * 24 * 3600
 
+    # --- AI agent (all optional; the service runs without any of it) ---
+    agent_enabled: bool = False
+    agent_interval_s: int = 60
+    agent_act_threshold: Decimal = Decimal("0.80")
+    agent_suggest_threshold: Decimal = Decimal("0.50")
+    signals_source_network: str = "mainnet"  # read-only market signals; execution stays on HL_API_URL (testnet)
+    signals_hl_url: str = "https://api.hyperliquid.xyz"  # info reads ONLY: never an Exchange, never a key
+    jev_base_url: str = "https://gateway.ngrok.ai/v1"
+    jev_api_key: str = ""
+    jev_model: str = "jev-latest"
+    jev_auth_header: str = "auto"  # auto | bearer | x-api-key: auto tries Authorization: Bearer first, then x-api-key on a 401
+    jev_timeout_s: float = 10
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_api_key: str = ""
+    llm_model: str = "deepseek-chat"
+    llm_max_tokens: int = 800
+    llm_timeout_s: float = 20
+
     allow_mainnet: bool = False
     dev_auth_bypass: bool = False  # DEV ONLY: skip signed-message authorization. Refused when ALLOW_MAINNET=true.
     auth_max_age_s: int = 60  # a signed message older than this is rejected
@@ -60,6 +78,12 @@ class Settings(BaseSettings):
     @classmethod
     def _blank_is_none(cls, v):
         return None if isinstance(v, str) and not v.strip() else v
+
+    @property
+    def signals_url(self) -> str:
+        """Where market signals are read: mainnet info by default (testnet gold has thin books and 0% funding), or the
+        execution testnet when SIGNALS_SOURCE_NETWORK=testnet."""
+        return self.hl_api_url if self.signals_source_network == "testnet" else self.signals_hl_url
 
     @property
     def is_hl_testnet(self) -> bool:
@@ -101,6 +125,7 @@ class Market(BaseModel):
     pyth_feed_id: str
     max_leverage: int = 3
     max_staleness_s: int = 30
+    unit: str = "units"  # what one unit of the asset is called in messages shown to people (gold: "oz")
     enabled: bool = True  # false lists the market as "coming_soon" and refuses new strategies on it
 
     @property

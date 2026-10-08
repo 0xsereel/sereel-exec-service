@@ -216,3 +216,6 @@ def register(sched) -> None:
 
     sched.add_job(tick, "interval", seconds=5, id="deposit-watcher", max_instances=1, coalesce=True, misfire_grace_time=5)
     sched.add_job(snapshots, "interval", seconds=60, id="pnl-snapshots", max_instances=1, coalesce=True, misfire_grace_time=30)
+    from ..ai import samples
+
+    samples.register(sched)  # the minute price sampler rides along with the watcher's jobs
