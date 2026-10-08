@@ -219,3 +219,6 @@ def register(sched) -> None:
     from ..ai import samples
 
     samples.register(sched)  # the minute price sampler rides along with the watcher's jobs
+    from ..ai import loop
+
+    loop.register(sched)  # the agent cycle (only when AGENT_ENABLED)

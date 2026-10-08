@@ -572,6 +572,7 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `WITHDRAW_NOT_AUTHORIZED` | 503 | withdrawing needs the master key, which is not configured |
 | `WITHDRAW_FAILED` | 400 | the bridge rejected the withdrawal |
 | `PAYMENT_FAILED` | 502 | the Solana payout failed |
+| `SIGNALS_UNAVAILABLE` | 503 | the agent could not read enough market data (neither Pyth nor Hyperliquid) to take a decision this cycle |
 | `AGENT_DISABLED` | 503 | the AI agent is switched off (AGENT_ENABLED=false) |
 | `LLM_UNAVAILABLE` | 503 | the language model could not be reached or is not configured; the chat cannot respond (use the manual form) |
 | `CHAT_SESSION_EXPIRED` | 410 | the chat session is older than 24 hours; start a new one |
@@ -674,4 +675,50 @@ normal signed deploy with the draft's values. Needs `AGENT_ENABLED=true` and an 
   (`CHAT_LIMIT_REACHED`), 4,000 characters per message. If the model is unreachable or unconfigured the call fails with
   `LLM_UNAVAILABLE` and **nothing is stored** for that turn, so Cantina can fall back to the manual form.
 - **Unsupported requests** (another asset, covered calls) return `status: "unsupported"` with what is available.
+
+## AI agent (Step 3: decisions, the monitoring loop, the feed)
+
+With `AGENT_ENABLED=true` a job runs every `AGENT_INTERVAL_S` (60 for a demo, 300 in production): for each **active** strategy it builds
+a snapshot, asks Jev (or the rules fallback), decides with plain code, has the model explain it, and stores one decision. **Nothing here
+moves money**: proposals wait for the owner. One strategy's failure never stops the others.
+
+| Step | Code | Notes |
+|---|---|---|
+| Decide | `app/ai/decide.py` | pure function of the snapshot, the strategy and the probabilities |
+| Explain | `app/ai/explain.py` | model text only; strict JSON schema, else a deterministic template; `none` never calls the model |
+| Store | `app/ai/decisions.py` | the feed, supersession, heartbeat, resolution |
+
+**Rules** (thresholds `AGENT_ACT_THRESHOLD` 0.80 and `AGENT_SUGGEST_THRESHOLD` 0.50; below 0.50 nothing; from 0.50 up to 0.80 a
+`suggest`; from 0.80 a `propose`):
+1. `hold`: `venue_price_divergence` or `abnormal_price_move` fires. It beats everything else; the action is `{"type":"hold"}`.
+2. `top_up`: `needs_top_up_soon`. `amount_usd` is the whole dollars that bring equity to 2x maintenance margin (and cover any shortfall
+   against the requirement).
+3. `rebalance`: `should_rebalance` and `liquidity_sufficient` >= 0.5, and the trade is worth the venue's minimum order and the
+   strategy's cash can margin it. `target_size` comes from the strategy's own settings.
+4. `return_excess`: `excess_margin_safe_to_return` and equity > 2x the requirement. `amount_usd` leaves 1.5x the requirement.
+
+Every parameter is a string computed from the strategy's state; the model never supplies one. Hard caps: no action on a strategy that
+is not `active` or has no owner. Only a rebalance by a delegated agent can ever be `execute` (delegation arrives in the next step);
+`execute` is downgraded to `propose` when the execution testnet is more than `AGENT_EXEC_MAX_DIVERGENCE_BPS` (50) from Pyth, or one
+action was already executed in the last `AGENT_EXEC_CAP_S` (10 minutes). Top-ups and returns of margin never execute.
+
+**The feed.** `GET /strategies/{id}/agent/decisions?limit=50` (newest first) returns decisions with every field always present:
+`id, at, strategy_id, state_hash, signals_source (jev|rules), signals_network, question_set_version, signals, decision
+(none|hold|suggest|propose|execute), action {type, params}, reason, downgraded_from, explanation {headline, explanation, risk_note},
+outcome (pending|executed|rejected|dismissed|failed), action_id, attestation_sig`. Quiet cycles do not flood it: the newest `none` row
+is updated in place. A newer proposal of the same type dismisses the older one.
+
+**Owner actions** (signed, flat string params): `POST /strategies/{id}/agent/decisions/{did}/dismiss` (`dismiss_decision`,
+`{decision_id}`), and `POST /agent/run-once` (`run_once`, `{strategy_id}`) which runs one cycle now and returns the decision, including
+`none`. A second `run_once` on the same strategy within 30 s (`AGENT_RUN_ONCE_COOLDOWN_S`) returns the latest decision and makes no Jev
+or model call. `GET /agent/status` returns `{enabled, signals_network, execution_network, interval_s, last_cycle_at, jev_model,
+llm_model, agent_pubkey}` (`agent_pubkey` is null until delegation exists).
+
+**Proposals resolve on their own.** When the owner executes the same action type on that strategy, the pending proposal becomes
+`executed` and links the action: a rebalance that traded (a no-op does not count), a top-up funding intent that completed (not one
+that is only underfunded), or a return of excess margin once its withdrawal completes. Cantina's Approve is just the prefilled modal;
+there is no extra call. `GET /strategies` rows gain `agent_mode` (`monitoring` while the agent is on, `null` when off; `autopilot`
+once a delegate grant exists) and `has_unread_proposal` (a suggestion or proposal is waiting).
+
+`SIGNALS_UNAVAILABLE` (503) is returned by `run_once` when neither Pyth nor Hyperliquid could be read.
 

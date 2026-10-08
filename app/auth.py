@@ -33,7 +33,7 @@ from .models import Strategy, UsedNonce, now
 
 log = logging.getLogger("sereel.auth")
 PREFIX, NETWORK = "sereel-strategy-v1", "solana"
-ACTIONS = ("return_excess", "close_strategy", "rebalance", "edit_hedge_settings", "change_owner")
+ACTIONS = ("return_excess", "close_strategy", "rebalance", "edit_hedge_settings", "change_owner", "dismiss_decision", "run_once")
 NONCE_TTL_S = 120  # anything older than the 60s age limit is already rejected; keep a margin
 
 
@@ -53,6 +53,8 @@ FIELD_TYPES = {
     "destination_wallet_address": "str",
     "owner_pubkey": "str",
     "owner_multisig": "str",
+    "decision_id": "str",
+    "strategy_id": "str",
 }
 
 

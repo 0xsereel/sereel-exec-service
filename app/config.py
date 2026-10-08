@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     agent_interval_s: int = 60
     agent_act_threshold: Decimal = Decimal("0.80")
     agent_suggest_threshold: Decimal = Decimal("0.50")
+    agent_run_once_cooldown_s: int = 30  # a second run_once on the same strategy inside this returns the latest decision
+    agent_exec_cap_s: int = 600  # at most one executed agent action per strategy in this window
+    agent_exec_max_divergence_bps: Decimal = Decimal(50)  # execute is downgraded to propose when the execution venue is further from Pyth
     chat_session_ttl_h: int = 24
     chat_max_messages: int = 30  # user messages per session
     chat_max_chars: int = 4000  # per message

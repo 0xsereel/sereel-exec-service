@@ -172,6 +172,26 @@ class ChatSession(SQLModel, table=True):
     status: str = "collecting"  # collecting | ready | unsupported
 
 
+class AgentDecision(SQLModel, table=True):
+    """One cycle's outcome for one strategy. `none` rows are a heartbeat: the newest one is updated in place, not appended."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    at: datetime = Field(default_factory=now, index=True)
+    state_hash: str
+    signals_source: str  # jev | rules
+    signals_network: str
+    question_set_version: str
+    signals: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))  # name -> probability string
+    decision: str  # none | hold | suggest | propose | execute
+    action: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))  # {type, params}
+    explanation: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))  # {headline, explanation, risk_note}
+    reason: str = ""  # the rule that fired, one deterministic line
+    downgraded_from: str | None = None
+    outcome: str = Field(default="pending", index=True)  # pending | executed | rejected | dismissed | failed
+    action_id: str | None = None  # the Action row that resolved it
+    attestation_sig: str | None = None
+
+
 class Withdrawal(SQLModel, table=True):
     """Return-excess and close share this state machine."""
     id: str = Field(default_factory=new_id, primary_key=True)

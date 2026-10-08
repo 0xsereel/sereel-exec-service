@@ -393,14 +393,17 @@ def test_existing_strategy_answers_from_its_state_and_drafts_only_the_three_acti
 
 
 def test_action_drafts_have_exact_deterministic_params():
-    view = {"status": "active", "required_margin_usd": 100.0, "target_hedge_size_units": 0.12, "hedge_gap_units": 0.03, "value_usd": 90.0,
-            "position": {"margin_usd": 100.0, "maintenance_margin_usd": 50.0, "mark_price_usd": 2650.0}}
+    view = {"status": "active", "leverage": 3, "required_margin_usd": 100.0, "target_hedge_size_units": 0.12, "hedge_gap_units": 0.03,
+            "value_usd": 90.0, "position": {"margin_usd": 150.0, "maintenance_margin_usd": 50.0, "mark_price_usd": 2650.0, "size_units": 0.09}}
     d, _ = actions.draft(view, "top_up")  # equity 90 -> ratio 1.8; 2.0 needs 100 of equity -> +10
     assert d == {"type": "top_up", "params": {"amount_usd": "10"}, "summary": "Top up $10 to bring equity back to 2x maintenance margin"}
     d, _ = actions.draft(view, "rebalance")
     assert d["type"] == "rebalance" and d["params"] == {"target_size": "0.12"} and "0.12 oz" in d["summary"]
     d, text = actions.draft({**view, "hedge_gap_units": 0.002}, "rebalance")  # $5.30: under the venue minimum
     assert d is None and "minimum order" in text
+    poor = {**view, "position": {**view["position"], "margin_usd": 50.0}}  # 0.12 oz at 3x needs 106 of margin: top up first
+    d, text = actions.draft(poor, "rebalance")
+    assert d is None and "top up first" in text
     rich = {**view, "position": {**view["position"], "margin_usd": 300.0}, "value_usd": 300.0}
     assert actions.draft(rich, "return_excess")[0]["params"] == {"amount_usd": "150"}  # 300 - 1.5 * 100
     assert actions.draft(rich, "top_up")[0] is None and actions.draft(view, "return_excess")[0] is None

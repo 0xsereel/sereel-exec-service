@@ -63,7 +63,14 @@ def rebalance_params(view: dict) -> tuple[dict | None, str | None]:
         return None, "the hedge is already at its target"
     if mark and abs(gap) * mark < settings.min_order_usd * D("1.05"):
         return None, f"the change ({abs(gap)} oz, about ${abs(gap) * mark:.2f}) is below the venue's ${settings.min_order_usd} minimum order"
-    return {"target_size": format(_d(view["target_hedge_size_units"]).normalize(), "f")}, None
+    target, current = _d(view["target_hedge_size_units"]), _d(pos.get("size_units")) or D(0)
+    if target > current and mark:  # growing the short needs margin: the rebalance itself would refuse INSUFFICIENT_MARGIN
+        cash = (_d(pos.get("margin_usd")) or D(0)) + (_d(pos.get("realized_pnl_usd")) or D(0)) \
+            - (_d(pos.get("funding_paid_usd")) or D(0)) - (_d(pos.get("fees_usd")) or D(0))
+        needed = target * mark / D(view["leverage"])
+        if needed > cash:
+            return None, f"a {format(target.normalize(), 'f')} oz short needs about ${needed:.2f} of margin and the strategy holds ${cash:.2f}: top up first"
+    return {"target_size": format(target.normalize(), "f")}, None
 
 
 def draft(view: dict, kind: str) -> tuple[dict | None, str]:

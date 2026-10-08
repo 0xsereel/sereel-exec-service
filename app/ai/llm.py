@@ -19,13 +19,15 @@ class LLMUnavailable(ServiceError):
         super().__init__("LLM_UNAVAILABLE", f"the assistant is unavailable right now ({why}); use the manual strategy form", 503)
 
 
-def chat_completion(messages: list[dict], tools: list[dict] | None = None) -> dict:
+def chat_completion(messages: list[dict], tools: list[dict] | None = None, json_mode: bool = False) -> dict:
     """One request; returns the assistant message ({role, content, tool_calls?}). Raises LLMUnavailable."""
     if not settings.llm_api_key:
         raise LLMUnavailable("LLM_API_KEY is not set")
     body = {"model": settings.llm_model, "messages": messages, "max_tokens": settings.llm_max_tokens, "temperature": 0.2}
     if tools:
         body["tools"] = tools
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
     t0 = time.monotonic()
     try:
         r = httpx.post(settings.llm_base_url.rstrip("/") + "/chat/completions", json=body,

@@ -24,6 +24,7 @@ from ..state import state
 from ..util import iso, num
 from ..venue.base import DEFAULT_SLIPPAGE, account_lock
 from . import attest as att
+from ..ai import decisions
 
 log = logging.getLogger("sereel.strategies")
 LIVE = (S_ACTIVE, S_REBALANCING, S_CLOSING)  # statuses in which the strategy holds margin and a position
@@ -622,6 +623,7 @@ def confirm_deposit(did: str) -> None:
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
+    decisions.resolve_executed(sid, "top_up")  # the top-up funding intent completed: a pending top-up proposal is answered
     take_snapshot(sid, "deposit")
 
 
@@ -934,6 +936,7 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
+    decisions.resolve_executed(sid, "rebalance")  # a pending proposal of this type is now answered
     take_snapshot(sid, "rebalance")
     return get_strategy(sid, org)
 
@@ -1107,6 +1110,7 @@ def strategy_out(st: Strategy) -> dict:
         "deployed_at": iso(st.deployed_at), "closed_at": iso(st.closed_at), "position": position_out(st, mark),
         "market_closed": bool(venue().market_closed.get(st.market_id, False)), "failure_reason": st.failure_reason,
         "hedge_gap_units": num(gap_units), "hedge_gap_bps": gap_bps,  # target short minus current short; > 0 = under-hedged
+        "agent_mode": decisions.agent_mode(st.id), "has_unread_proposal": decisions.has_unread_proposal(st.id),
     }
 
 
