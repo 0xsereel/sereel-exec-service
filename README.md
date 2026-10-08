@@ -644,3 +644,34 @@ The AI layer only ever reads and proposes; no model can move money. Step 1 is th
 - **Not included:** PAXG/Oro on Solana via Jupiter (reported as absent: "mint not verified"; a guessed mint would price the wrong token).
 - **Try it:** `sereel agent signals [--size-oz 0.05]` (market only; the size enables the liquidity question) or `sereel agent signals --strategy <id>` (needs `sereel serve` running).
 
+## AI agent (Step 2: setup assistant)
+
+`POST /agent/chat` turns "I need a delta neutral hedge on gold" into a validated strategy **draft**. It never deploys: Cantina runs the
+normal signed deploy with the draft's values. Needs `AGENT_ENABLED=true` and an OpenAI-compatible model (`LLM_BASE_URL`, `LLM_API_KEY`,
+`LLM_MODEL`; DeepSeek by default).
+
+- **Request:** `{session_id?, message, context: {owner_pubkey, funds: [{fund_id, name, nav_usd, shares, exposures: [{asset, units}]}],
+  wallets: [{address, label, usdc_balance}], strategy_id?}}`. Everything is a string. Cantina supplies funds and wallets because the
+  service does not hold them; they are validated as data (types, lengths, at most 20 funds and 10 wallets) and never obeyed as
+  instructions. `GET /agent/chat/{id}` returns the session.
+- **Response:** `{session_id, status: collecting | ready | unsupported, reply, quick_replies, draft, action_draft}`; every field is always
+  present. `quick_replies` are computed by the server from the next missing slot, not written by the model.
+- **How it works.** The model's only power is tool calls. `set_slot` hands a value to the server's validators (market exists and is
+  open, hedge ratio 1-100%, leverage 1 to the market cap, band 1-20%, exposure positive, fund and wallet from the owner's context
+  (an unambiguous partial name works), margin amount within the wallet's USDC balance); a rejected value goes back to the model with the
+  reason and is never stored. So "set leverage to 25" produces a rejection, not a 25x draft. The draft is `ready` only when every slot
+  is valid **and** the same `quote_strategy` function that `POST /strategies` uses accepts it (minimum order value, required margin
+  with the 20% buffer), so a draft is never a strategy that create would refuse. `computed.*` (target size, notional, required margin,
+  estimated liquidation price) come from that code; the model writes only the reply text and the rationale.
+- **Recommendation.** From Jev's setup answers through plain rules: leverage 2x and hedge ratio 75% if `volatility_elevated` >= 0.7
+  (else 3x and 60%). If `liquidity_sufficient_for_size` < 0.5 the draft carries `recommendation.risk_note`: "thin order book on the
+  execution venue; the order may not fully fill". **Liquidity never changes the size or the ratio**, only adds that note. It is a
+  suggestion; the manager decides. If signals cannot be read, the chat continues without it.
+- **An existing strategy** (`context.strategy_id`, owner must match): answers from its state and can return `action_draft`
+  `{type, params, summary}` for `rebalance` (`{target_size}`), `top_up` (`{amount_usd}`: whole dollars that bring equity to 2x
+  maintenance margin) or `return_excess` (`{amount_usd}`: margin above 1.5x the requirement). Edit and close get a text answer only.
+- **Limits:** sessions last 24 h (`CHAT_SESSION_EXPIRED`), 30 user messages per session and 12 per minute per owner
+  (`CHAT_LIMIT_REACHED`), 4,000 characters per message. If the model is unreachable or unconfigured the call fails with
+  `LLM_UNAVAILABLE` and **nothing is stored** for that turn, so Cantina can fall back to the manual form.
+- **Unsupported requests** (another asset, covered calls) return `status: "unsupported"` with what is available.
+

@@ -32,6 +32,7 @@ SLOTS = ("template", "market", "fund_id", "exposure_units", "hedge_ratio_pct", "
 AVAILABLE = "Available now: a delta-neutral hedge (a short that offsets a fund's gold exposure) on gold (XAU-HL)."
 DEFAULT_RATIO_PCT = D(60)
 ELEVATED = D("0.7")
+THIN_BOOK_NOTE = "thin order book on the execution venue; the order may not fully fill"
 HISTORY = 16  # most recent messages sent to the model
 _rate: dict[str, deque] = defaultdict(deque)
 
@@ -186,17 +187,13 @@ def recommend(snap, sig, exposure: D, cap: int) -> dict:
     p = sig.probabilities
     elevated = p.get("volatility_elevated", D(0)) >= ELEVATED
     rec = {"leverage": str(min(2 if elevated else 3, cap)), "hedge_ratio_pct": "75" if elevated else "60", "warnings": [],
-           "max_size_oz": None, "signals_source": sig.source, "question_set_version": sig.question_set_version,
+           "risk_note": None, "signals_source": sig.source, "question_set_version": sig.question_set_version,
            "signals": {k: format(v.quantize(D("0.01")), "f") for k, v in sorted(p.items())}}
     if elevated:
         rec["warnings"].append("Gold volatility is elevated against its 7-day norm: a lower leverage and a larger hedge are suggested.")
     liq = p.get("liquidity_sufficient_for_size")
     if liq is not None and liq < D("0.5"):
-        depth = snap.get("execution", "testnet_depth_sell_within_0.5pct_oz")
-        max_size = (depth / 2).quantize(D("0.0001"), rounding="ROUND_DOWN") if depth is not None else None
-        rec["max_size_oz"] = _fmt(max_size) if max_size is not None else None
-        rec["warnings"].append("The order book is thin for this size" + (
-            f": about {_fmt(max_size)} oz can be shorted with margin to spare. Consider a smaller exposure." if max_size is not None else "."))
+        rec["risk_note"] = THIN_BOOK_NOTE  # a note only: liquidity never changes the size or the ratio
     return rec
 
 
@@ -234,7 +231,7 @@ def build_draft(session: ChatSession, slots: dict, rationale_fn=None) -> dict:
         "margin_wallet": slots["margin_wallet"], "margin_amount_usd": slots["margin_amount_usd"],
         "computed": {"target_size": _fmt(size), "notional_usd": f"{size * mark:.2f}", "required_margin_usd": f"{required:.2f}",
                      "est_liquidation_price": f"{liq:.2f}" if liq is not None else None},
-        "recommendation": {"signals_source": rec.get("signals_source"), "signals": rec.get("signals", {}),
+        "recommendation": {"signals_source": rec.get("signals_source"), "signals": rec.get("signals", {}), "risk_note": rec.get("risk_note"),
                            "rationale": (rationale_fn or rationale)(slots, rec, size, required, liq)}}
     return draft
 
@@ -243,6 +240,8 @@ def template_rationale(slots: dict, rec: dict, size: D, required: D, liq: D | No
     bits = [f"A {slots['hedge_ratio_pct']}% hedge of {slots['exposure_units']} oz is a short of {_fmt(size)} oz at {slots['leverage']}x, "
             f"needing about ${required:.2f} of margin" + (f" and liquidating near ${liq:.2f}." if liq is not None else ".")]
     bits += rec.get("warnings", [])
+    if rec.get("risk_note"):
+        bits.append("Note: " + rec["risk_note"] + ".")
     return " ".join(bits)[:600]
 
 
@@ -251,7 +250,7 @@ def rationale(slots, rec, size, required, liq) -> str:
     it never feeds back into a parameter."""
     facts = {"hedge_ratio_pct": slots["hedge_ratio_pct"], "leverage": slots["leverage"], "target_size_oz": _fmt(size),
              "required_margin_usd": f"{required:.2f}", "est_liquidation_price": f"{liq:.2f}" if liq else None,
-             "signals": rec.get("signals", {}), "warnings": rec.get("warnings", [])}
+             "signals": rec.get("signals", {}), "warnings": rec.get("warnings", []), "risk_note": rec.get("risk_note")}
     try:
         text = llm.chat_completion([
             {"role": "system", "content": "You explain a hedge setup in 2-3 plain sentences (max 500 characters) for a fund manager. Use ONLY the "

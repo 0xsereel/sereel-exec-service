@@ -249,7 +249,7 @@ def test_recommendation_follows_the_setup_signals(api, monkeypatch):
                           ("get_recommendation", {})]), ("text", "I suggest 3x and 60%."))
     say(api, s)
     rec = s.tool_results[-1]
-    assert rec["available"] and (rec["leverage"], rec["hedge_ratio_pct"], rec["warnings"], rec["signals_source"]) == ("3", "60", [], "jev")
+    assert rec["available"] and (rec["leverage"], rec["hedge_ratio_pct"], rec["warnings"], rec["risk_note"], rec["signals_source"]) == ("3", "60", [], None, "jev")
     assert rec["signals"] == {"funding_favors_shorts": "0.90", "liquidity_sufficient_for_size": "0.90", "volatility_elevated": "0.20"}
     monkeypatch.setattr(chat, "market_signals", fake_signals(vol="0.8", liq="0.3"))
     s2 = Script(("tools", [("set_slot", {"name": "template", "value": "delta_neutral"}), ("set_slot", {"name": "market", "value": M}),
@@ -257,9 +257,28 @@ def test_recommendation_follows_the_setup_signals(api, monkeypatch):
                            ("get_recommendation", {})]), ("text", "Volatile and thin."))
     r = say(api, s2)
     rec = s2.tool_results[-1]
-    assert (rec["leverage"], rec["hedge_ratio_pct"]) == ("2", "75") and rec["max_size_oz"] == "0.0097"  # 0.0194 depth / 2
-    assert any("volatility is elevated" in w for w in rec["warnings"]) and any("thin" in w for w in rec["warnings"])
+    assert (rec["leverage"], rec["hedge_ratio_pct"]) == ("2", "75") and "max_size_oz" not in rec  # volatility moves ratio/leverage, never size caps
+    assert any("volatility is elevated" in w for w in rec["warnings"])
+    assert rec["risk_note"] == "thin order book on the execution venue; the order may not fully fill"
     assert r["quick_replies"] == ["60%", "75%", "90%"]
+
+
+def test_low_liquidity_adds_a_risk_note_and_changes_neither_size_nor_ratio(api, monkeypatch):
+    def ready_draft(liq):
+        monkeypatch.setattr(chat, "market_signals", fake_signals(vol="0.2", liq=liq))
+        chat._rate.clear()
+        return say(api, Script(set_all(full_slots()), ("text", "Done.")), "everything")["draft"]
+
+    deep, thin = ready_draft("0.95"), ready_draft("0.05")
+    assert deep["recommendation"]["risk_note"] is None
+    assert thin["recommendation"]["risk_note"] == "thin order book on the execution venue; the order may not fully fill"
+    assert thin["computed"] == deep["computed"] and thin["computed"]["target_size"] == "0.12"  # size unchanged
+    for k in ("exposure_units", "hedge_ratio_bps", "leverage", "margin_amount_usd"):
+        assert thin[k] == deep[k]
+    text = chat.template_rationale(full_slots(), {"risk_note": chat.THIN_BOOK_NOTE, "warnings": []}, D("0.12"), D("127.2"), D("5000"))
+    assert "Note: thin order book on the execution venue; the order may not fully fill." in text  # the fallback rationale says it too
+    rec = chat.recommend(FakeSnap(), Signals({"volatility_elevated": D("0.2"), "liquidity_sufficient_for_size": D("0.05")}, "jev"), D("0.2"), 3)
+    assert (rec["leverage"], rec["hedge_ratio_pct"]) == ("3", "60") and "max_size_oz" not in rec  # liquidity alone leaves the suggestion alone
 
 
 def test_a_failure_reading_signals_does_not_stop_the_conversation(api, monkeypatch):
