@@ -1,6 +1,8 @@
 """`sereel agent ...`: the AI layer's operator tools."""
 import json
 
+import logging
+
 import httpx
 import typer
 from rich.console import Console
@@ -32,6 +34,7 @@ def _strategy(api_url: str, sid: str) -> dict:
 @agent_app.command("signals")
 def signals(strategy: str = typer.Option(None, "--strategy", help="Strategy id: adds its position and the monitoring questions"),
             market: str = typer.Option("XAU-HL", "--market"),
+            size_oz: str = typer.Option(None, "--size-oz", help="A proposed hedge size in oz: judged against testnet depth (setup question)"),
             api_url: str = typer.Option("http://localhost:8000", "--api-url", help="Running service, used only with --strategy"),
             raw: bool = typer.Option(True, "--raw/--no-raw", help="Print Jev's raw response")):
     """Print the market snapshot Jev is given, its hash, and the live probabilities (or the rules fallback, labelled)."""
@@ -40,12 +43,16 @@ def signals(strategy: str = typer.Option(None, "--strategy", help="Strategy id: 
     from app.ai.signals import get_signals
     from app.ai.state import build_snapshot
 
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     markets = load_markets()
     if market not in markets:
         _fail(f"unknown market '{market}'")
-    snap = build_snapshot(markets[market], _strategy(api_url, strategy) if strategy else None)
+    from decimal import Decimal
+
+    snap = build_snapshot(markets[market], _strategy(api_url, strategy) if strategy else None,
+                          size_oz=Decimal(size_oz) if size_oz else None)
     text = snap.to_state_text()
-    console.print(text)
+    console.print(text, markup=False)  # "[price]"-style section headers are text, not Rich markup
     console.print(f"state_hash: {snap.state_hash}")
     console.print(f"signals_network: {snap.signals_network}   execution_network: {snap.execution_network}   degraded: {snap.degraded}")
     sig = get_signals(snap)
@@ -60,3 +67,112 @@ def signals(strategy: str = typer.Option(None, "--strategy", help="Strategy id: 
     else:
         console.print(f"\n[yellow]Jev was not used: {sig.jev_error}[/]")
         console.print(f"  base: {settings.jev_base_url}   model: {settings.jev_model}   auth setting: {settings.jev_auth_header}")
+
+
+# ---- calibrate ----------------------------------------------------------------------------------------------------------
+# Three fixed states built from TODAY's real snapshot with edited numbers. Each question must point the right way in each one;
+# the table prints every probability, and the command exits 1 if any points wrong. Live Jev only (about 6 calls, a fraction of a
+# cent); deliberately not part of pytest.
+SYNTH_STRATEGY = {"id": "calibration", "status": "active", "leverage": 3, "target_exposure_units": 0.2, "hedge_ratio_bps": 6000,
+                  "target_hedge_size_units": 0.12, "hedge_gap_units": 0.0036, "hedge_gap_bps": 300, "rebalance_band_bps": 500,
+                  "required_margin_usd": 165.0, "value_usd": 400.0,
+                  "position": {"size_units": 0.1164, "margin_usd": 400.0, "maintenance_margin_usd": 90.0, "unrealized_pnl_usd": -1.0,
+                               "funding_paid_usd": 0.0, "mark_price_usd": 4126.0, "liquidation_price_usd": 5400.0}}
+
+CALM = [("volatility", "realized_vol_24h_annualized", "15.00%"), ("volatility", "realized_vol_7d_annualized", "16.00%"),
+        ("volatility", "vol_ratio_24h_7d", "0.94"), ("volatility", "move_1h_sigmas", "0.40"), ("volatility", "change_1h_pct", "0.050"),
+        ("venue", "mark_vs_pyth_bps", "0.2"), ("venue", "funding_rate_annualized", "8.00%"),
+        ("calendar", "events_within_24h", "none"),
+        ("sizing", "depth_to_size_ratio", "20.00"), ("sizing", "testnet_depth_same_side_within_0.5pct_oz", "1.0000"),
+        ("strategy", "maintenance_ratio", "4.50"), ("strategy", "equity_to_required_ratio", "2.60"), ("strategy", "gap_pct", "3.00"),
+        ("sizing", "size_notional_usd", "15.00")]
+STRESSED = [("volatility", "realized_vol_24h_annualized", "45.00%"), ("volatility", "realized_vol_7d_annualized", "20.00%"),
+            ("volatility", "vol_ratio_24h_7d", "2.25"), ("volatility", "move_1h_sigmas", "4.20"), ("volatility", "change_1h_pct", "-3.200"),
+            ("venue", "mark_vs_pyth_bps", "3.0"), ("venue", "funding_rate_annualized", "-4.00%"),
+            ("calendar", "events_within_24h", "CPI release (September 2026 data)"),
+            ("sizing", "depth_to_size_ratio", "0.20"), ("sizing", "testnet_depth_same_side_within_0.5pct_oz", "0.0100"),
+            ("strategy", "maintenance_ratio", "1.30"), ("strategy", "equity_to_required_ratio", "0.80"), ("strategy", "gap_pct", "9.00"),
+            ("sizing", "size_notional_usd", "52.00")]
+DIVERGENT = CALM[:5] + [("venue", "mark_vs_pyth_bps", "60.0")] + CALM[6:]
+
+# question -> expected direction per scenario: ">" means the probability must exceed 0.5, "<" that it must be below
+EXPECT = {
+    "calm": {"volatility_elevated": "<", "funding_favors_shorts": ">", "abnormal_price_move": "<", "venue_price_divergence": "<",
+             "high_impact_event_soon": "<", "liquidity_sufficient_for_size": ">", "needs_top_up_soon": "<", "should_rebalance": "<",
+             "liquidity_sufficient": ">", "excess_margin_safe_to_return": ">"},
+    "stressed": {"volatility_elevated": ">", "funding_favors_shorts": "<", "abnormal_price_move": ">", "venue_price_divergence": "<",
+                 "high_impact_event_soon": ">", "liquidity_sufficient_for_size": "<", "needs_top_up_soon": ">", "should_rebalance": ">",
+                 "liquidity_sufficient": "<", "excess_margin_safe_to_return": "<"},
+    "divergent": {"venue_price_divergence": ">", "volatility_elevated": "<", "abnormal_price_move": "<", "needs_top_up_soon": "<",
+                  "funding_favors_shorts": ">", "high_impact_event_soon": "<"},
+}
+
+
+def _edited(snap, edits):
+    import copy
+
+    out = copy.deepcopy(snap)
+    for sec, key, val in edits:
+        if sec in out.sections:
+            out.sections[sec][key] = val
+    if "venue" in out.sections and any(k == "mark_vs_pyth_bps" for _, k, _ in edits):
+        out.sections["venue"]["hl_mark"] = out.sections["venue"]["hl_mark"]  # the bps field is what the question reads
+    return out
+
+
+@agent_app.command("calibrate")
+def calibrate(market: str = typer.Option("XAU-HL", "--market")):
+    """Ask Jev the questions against three fixed states (calm, stressed, divergent) built from today's real snapshot with edited
+    numbers, print the answers, and exit 1 if any answer points the wrong way. Uses live Jev; not part of pytest."""
+    from decimal import Decimal
+
+    from rich.table import Table
+
+    from app.ai import jev
+    from app.ai.questions import QUESTION_SET_VERSION, question_names
+    from app.ai.state import build_snapshot
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    markets = load_markets()
+    if market not in markets:
+        _fail(f"unknown market '{market}'")
+    base_market = build_snapshot(markets[market], None, size_oz=Decimal("0.05"))  # setup + market questions (a proposed 0.05 oz hedge)
+    base_strategy = build_snapshot(markets[market], SYNTH_STRATEGY)  # monitoring questions (a synthetic live strategy)
+    results: dict[str, dict[str, float]] = {}
+    tokens = 0
+    for name, edits in (("calm", CALM), ("stressed", STRESSED), ("divergent", DIVERGENT)):
+        results[name] = {}
+        for snap in (_edited(base_market, edits), _edited(base_strategy, edits)):
+            names = [n for n in question_names(snap) if n in EXPECT[name]]
+            if not names:
+                continue
+            try:
+                r = jev.ask(snap.to_state_text(), names)
+            except jev.JevError as e:
+                _fail(f"Jev failed on the {name} state: {e}")
+            tokens += r.usage.get("input_tokens", 0) + r.usage.get("output_tokens", 0)
+            results[name].update({n: float(p) for n, p in r.probabilities.items()})
+    table = Table(title=f"calibration (question set {QUESTION_SET_VERSION}, today's real snapshot with edited numbers)")
+    table.add_column("question", no_wrap=True)
+    for sc in EXPECT:
+        table.add_column(sc, justify="right")
+    wrong = []
+    for q in sorted({q for sc in EXPECT.values() for q in sc}):
+        row = [q]
+        for sc, exp in EXPECT.items():
+            if q not in exp:
+                row.append("[dim]-[/]")
+                continue
+            p = results[sc].get(q)
+            ok = p is not None and ((p > 0.5) if exp[q] == ">" else (p < 0.5))
+            if not ok:
+                wrong.append((sc, q, p, exp[q]))
+            row.append(f"{'[green]ok[/]' if ok else '[red]WRONG[/]'} {p:.2f} ({exp[q]}.5)" if p is not None else "[red]missing[/]")
+        table.add_row(*row)
+    console.print(table)
+    console.print(f"tokens used: {tokens}")
+    if wrong:
+        for sc, q, p, e in wrong:
+            console.print(f"[red]{sc}: {q} = {p} but must be {e} 0.5[/]")
+        raise typer.Exit(1)
+    console.print("[green]all answers point the right way[/]")

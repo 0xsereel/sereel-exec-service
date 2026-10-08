@@ -1,60 +1,53 @@
-"""The deterministic stand-in for Jev: the same questions answered from thresholds on the snapshot. Used when Jev is not
-configured or fails; the result is labelled signals_source "rules" so nobody mistakes it for a model's calibrated number.
-Probabilities here are coarse on purpose (0.05 / 0.6 / 0.9...), never pretending to precision."""
+"""The deterministic stand-in for Jev: the SAME questions with the SAME thresholds (see questions.py), computed on the snapshot's
+numbers. Used when Jev is unconfigured or down; the result is labelled signals_source "rules". Values are 0.95 / 0.05 where the
+threshold decides and 0.5 in the explicitly uncertain band, never pretending to more precision than that."""
 from decimal import Decimal
 
-from ..config import settings
 from .state import Snapshot
 
 D = Decimal
+YES, NO, MAYBE = D("0.95"), D("0.05"), D("0.5")
 
 
-def _p(x: str) -> Decimal:
-    return D(x)
+def _band(value: D | None, yes: bool, no: bool) -> D:
+    if value is None:
+        return MAYBE
+    return YES if yes else NO if no else MAYBE
 
 
 def answer(snap: Snapshot, names: list[str]) -> dict[str, Decimal]:
     g = snap.get
     out: dict[str, Decimal] = {}
-    ratio = g("strategy", "maintenance_ratio")
-    equity, required = g("strategy", "equity_usd"), g("strategy", "required_margin_usd")
-    gap_pct, band_pct = g("strategy", "gap_pct"), g("strategy", "rebalance_band_pct")
-    v24, v7 = g("volatility", "realized_vol_24h_annualized"), g("volatility", "realized_vol_7d_annualized")
-    ch1 = g("volatility", "change_1h_pct")
     for n in names:
         if n == "needs_top_up_soon":
-            out[n] = _p("0.05") if ratio is None else _p("0.95") if ratio < D("1.5") else _p("0.6") if ratio < D("1.8") else _p("0.05")
+            ratio, sig = g("strategy", "maintenance_ratio"), g("volatility", "move_1h_sigmas")
+            out[n] = MAYBE if ratio is None else YES if ratio < D("1.5") or (ratio < D("1.8") and (sig or 0) > 2) \
+                else NO if ratio >= D("2.0") else MAYBE
         elif n == "should_rebalance":
-            out[n] = _p("0.05") if gap_pct is None or band_pct is None else _p("0.9") if gap_pct > band_pct else _p("0.1")
+            gap, band, usd = g("strategy", "gap_pct"), g("strategy", "rebalance_band_pct"), g("sizing", "size_notional_usd")
+            out[n] = NO if gap is None or band is None or usd is None else YES if gap > band and usd >= D("10.5") else NO
         elif n == "abnormal_price_move":
-            if ch1 is None or not v24:
-                out[n] = _p("0.1")
-            else:
-                hourly_sigma_pct = v24 / D(str(24 * 365)).sqrt() * 100  # annualized -> one hour, in percent
-                z = abs(ch1) / hourly_sigma_pct if hourly_sigma_pct else D(0)
-                out[n] = _p("0.9") if z > 3 else _p("0.6") if z > 2 else _p("0.05")
+            sig = g("volatility", "move_1h_sigmas")
+            out[n] = _band(sig, sig is not None and sig > 3, sig is not None and sig < 2)
         elif n == "venue_price_divergence":
-            bps = g("execution", "testnet_mark_vs_pyth_bps")
-            bps = abs(bps) if bps is not None else None
-            lim = settings.max_price_deviation_bps
-            out[n] = _p("0.1") if bps is None else _p("0.95") if bps >= lim else _p("0.6") if bps >= lim / 2 else _p("0.05")
-        elif n == "liquidity_sufficient":
-            have = g("execution", "testnet_depth_buy_within_0.5pct_oz")
-            need = g("strategy", "gap_oz")
-            out[n] = _p("0.5") if have is None or need is None else _p("0.95") if have >= abs(need) else _p("0.1")
+            bps = g("venue", "mark_vs_pyth_bps")
+            a = abs(bps) if bps is not None else None
+            out[n] = _band(a, a is not None and a > 15, a is not None and a < 8)
+        elif n in ("liquidity_sufficient", "liquidity_sufficient_for_size"):
+            r = g("sizing", "depth_to_size_ratio")
+            out[n] = _band(r, r is not None and r >= 2, r is not None and r < 1)
         elif n == "excess_margin_safe_to_return":
-            out[n] = _p("0.9") if ratio is not None and ratio > 3 and equity and required and equity > 2 * required else _p("0.1")
+            ratio, eq = g("strategy", "maintenance_ratio"), g("strategy", "equity_to_required_ratio")
+            out[n] = NO if ratio is None or eq is None else YES if ratio > 3 and eq > 2 else NO
         elif n == "high_impact_event_soon":
             ev = snap.sections.get("calendar", {}).get("events_within_24h")
-            out[n] = _p("0.1") if ev is None else _p("0.02") if ev == "none" else _p("0.95")
+            out[n] = MAYBE if ev is None else NO if ev == "none" else YES
         elif n == "volatility_elevated":
-            out[n] = _p("0.1") if not v24 or not v7 else _p("0.8") if v24 > v7 * D("1.3") else _p("0.2")
+            ratio, v24 = g("volatility", "vol_ratio_24h_7d"), g("volatility", "realized_vol_24h_annualized")
+            out[n] = MAYBE if ratio is None and v24 is None else YES if (ratio or 0) > D("1.3") or (v24 or 0) > 30 else NO
         elif n == "funding_favors_shorts":
-            f = g("venue", "funding_rate_hourly")
-            out[n] = _p("0.1") if f is None else _p("0.8") if f > 0 else _p("0.1")
-        elif n == "liquidity_sufficient_for_size":
-            have = g("execution", "testnet_depth_sell_within_0.5pct_oz")
-            out[n] = _p("0.5") if have is None else _p("0.9") if have >= D("0.05") else _p("0.1")
+            f = g("venue", "funding_rate_annualized")
+            out[n] = _band(f, f is not None and f > 2, f is not None and f < 1)
         else:
             raise KeyError(n)
     return out

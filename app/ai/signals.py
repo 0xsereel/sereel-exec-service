@@ -21,7 +21,7 @@ class Signals:
 
 
 def get_signals(snap: Snapshot, names: list[str] | None = None) -> Signals:
-    names = names or question_names(snap.has_strategy)
+    names = names or question_names(snap)
     try:
         res = jev.ask(snap.to_state_text(), names)
         return Signals(res.probabilities, "jev", jev_result=res, names=names)

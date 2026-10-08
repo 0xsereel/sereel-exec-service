@@ -602,7 +602,7 @@ The AI layer only ever reads and proposes; no model can move money. Step 1 is th
   (`signals_network`, `execution_network`). If mainnet reads fail it falls back to testnet and sets `degraded: true`.
 - **Sources in the snapshot:** Pyth price, confidence, publish time, market-open flag, and 1h/24h/7d change (Hermes historical
   endpoint); Hyperliquid mark, oracle, hourly and annualized funding, open interest, spread and depth within 0.5%, 1h/24h change and
-  realized volatility (24h, 7d) from hourly candles; the execution testnet's mark and depth; the other HIP-3 gold markets; and a
+  realized volatility (24h, 7d) from hourly candles; the execution testnet's mark and depth; other HIP-3 gold markets (context only, and only while their mark is within 1.5% of Pyth: outliers are listed with their mark for people but never shown to Jev), the native PAXG perp's funding per venue as a cross-venue reference (`predictedFundings` does not cover HIP-3 markets such as `xyz:GOLD`); and a
   calendar of FOMC and CPI events. Anything that cannot be read appears under `[unavailable]` with the reason, never silently dropped
   and never guessed. `price_samples` (one row per source per minute, kept 14 days) backs volatility if candles are down.
 - **Calendar.** `data/events.yaml` lists only events read from federalreserve.gov or bls.gov, each with its `source_url` and the date it
@@ -612,11 +612,31 @@ The AI layer only ever reads and proposes; no model can move money. Step 1 is th
   `answers.<name>.noul` in 0..1. The gateway documents two key headers; `JEV_AUTH_HEADER=auto` tries `Authorization: Bearer` and, on a
   401, `x-api-key`, and `sereel agent signals` prints which one worked. Timeout 10 s, one retry; the key is never logged (model,
   latency and token counts are).
-- **Questions** live in `app/ai/questions.py` (`QUESTION_SET_VERSION`, recorded with every decision): `needs_top_up_soon`,
-  `should_rebalance`, `abnormal_price_move`, `venue_price_divergence`, `liquidity_sufficient`, `excess_margin_safe_to_return`,
-  `high_impact_event_soon` ("Major economic event soon"), and for setup `volatility_elevated`, `funding_favors_shorts`,
-  `liquidity_sufficient_for_size`. "Margin health" in agent rules means **equity / maintenance margin** (top up below 1.5), not the
-  UI's `margin_health_bps`.
-- **Not included:** PAXG/Oro on Solana via Jupiter (no mint or endpoint could be confirmed, and a guessed mint would price the wrong token).
-- **Try it:** `sereel agent signals` (market only) or `sereel agent signals --strategy <id>` (needs `sereel serve` running).
+- **Questions** live in `app/ai/questions.py` (`QUESTION_SET_VERSION`, recorded with every decision). Each one names the exact
+  state fields it reads and a numeric threshold, in both `instructions` and `criteria`, so the model compares numbers instead of
+  forming an impression (an earlier wording let it answer 0.83 on a 1.1x volatility ratio). The same thresholds are mirrored in
+  `rules_signals.py`, and a test pins them:
+
+  | Question | Reads | Yes if |
+  |---|---|---|
+  | `volatility_elevated` | `vol_ratio_24h_7d`, `realized_vol_24h_annualized` | ratio > 1.3 or 24h vol > 30% |
+  | `venue_price_divergence` | `mark_vs_pyth_bps` (mainnet only) | abs > 15 bps (no if < 8) |
+  | `funding_favors_shorts` | `funding_rate_annualized` | > +2% (positive = longs pay shorts; no if < 1%) |
+  | `liquidity_sufficient_for_size` / `liquidity_sufficient` | `[sizing]`: `size_oz`, `depth_to_size_ratio` | testnet depth within 0.5% >= 2x the size (no if < 1) |
+  | `needs_top_up_soon` | `maintenance_ratio`, `move_1h_sigmas` | ratio < 1.5, or < 1.8 with a > 2 sigma move (no if >= 2.0) |
+  | `should_rebalance` | `gap_pct`, `rebalance_band_pct`, `size_notional_usd` | gap > band and trade >= $10.50 |
+  | `abnormal_price_move` | `move_1h_sigmas` | > 3 (no if < 2) |
+  | `excess_margin_safe_to_return` | `maintenance_ratio`, `equity_to_required_ratio` | ratio > 3.0 and equity > 2x required |
+  | `high_impact_event_soon` | `events_within_24h` | names an event |
+
+  Liquidity questions are judged against **testnet** depth (where orders execute) for a stated size and side; with no size known
+  they are not asked and the snapshot lists why under `[unavailable]`. The testnet section is kept in the record but labelled
+  "execution venue (not a market signal)". "Margin health" in agent rules means **equity / maintenance margin**, not the UI's
+  `margin_health_bps`.
+- **Calibration.** `sereel agent calibrate` asks live Jev the questions against three fixed states (calm, stressed, divergent) made
+  from today's real snapshot with edited numbers, prints a table, and exits 1 if any answer points the wrong way. It costs a fraction
+  of a cent and is deliberately not part of pytest; run it whenever a question's wording changes.
+- **Divergence** (`venue_price_divergence`) compares the `xyz:GOLD` mark with Pyth only; other markets never trigger anything.
+- **Not included:** PAXG/Oro on Solana via Jupiter (reported as absent: "mint not verified"; a guessed mint would price the wrong token).
+- **Try it:** `sereel agent signals [--size-oz 0.05]` (market only; the size enables the liquidity question) or `sereel agent signals --strategy <id>` (needs `sereel serve` running).
 

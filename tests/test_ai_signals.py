@@ -28,6 +28,10 @@ def candle_series(n=170, start=4100.0, step=0.7):
     return [{"c": str(round(start + (i % 7) * step - (i % 5) * step * 0.6, 2))} for i in range(n)]
 
 
+PAXG_LISTED = {"on": True}
+OTHER_MARKS = {"flx:GOLD": "4150.0", "hyna:GOLD": "4993.2"}  # flx is within 1.5% of Pyth 4126.3; hyna is a 21% outlier
+
+
 def fake_info(mainnet_fails=False, empty_book=False):
     def info(body, base=None):
         testnet = base == settings.hl_api_url
@@ -35,6 +39,10 @@ def fake_info(mainnet_fails=False, empty_book=False):
             raise hl_readonly.SignalsReadError(f"{body['type']}: HTTP 500")
         t = body["type"]
         if t == "metaAndAssetCtxs":
+            dex = body.get("dex")
+            if dex and f"{dex}:GOLD" in OTHER_MARKS:
+                return [{"universe": [{"name": f"{dex}:GOLD"}]},
+                        [{"markPx": OTHER_MARKS[f"{dex}:GOLD"], "oraclePx": "4126.3", "funding": "0.00000100", "openInterest": "1"}]]
             mark = "4135.4" if testnet else "4126.5"
             return [{"universe": [{"name": "xyz:GOLD"}]},
                     [{"markPx": mark, "oraclePx": "4126.3", "funding": "0.00000625", "openInterest": "73620.1"}]]
@@ -45,10 +53,13 @@ def fake_info(mainnet_fails=False, empty_book=False):
                 return {"levels": [[], []]}
             return {"levels": [[{"px": "4126.0", "sz": "10"}, {"px": "4100.0", "sz": "50"}],
                                [{"px": "4127.0", "sz": "20"}, {"px": "4150.0", "sz": "5"}]]}
+        if t == "meta":
+            return {"universe": [{"name": "BTC"}, {"name": "PAXG"}]} if PAXG_LISTED["on"] else {"universe": [{"name": "BTC"}]}
         if t == "predictedFundings":
-            return []
+            return [["BTC", []], ["PAXG", [["BinPerp", {"fundingRate": "0.00004", "fundingIntervalHours": 4}],
+                                           ["HlPerp", {"fundingRate": "0.0000125", "fundingIntervalHours": 1}]]]]
         if t == "perpDexs":
-            return [None, {"name": "xyz"}, {"name": "flx"}]
+            return [None, {"name": "xyz"}, {"name": "flx"}, {"name": "hyna"}]
         raise AssertionError(t)
     return info
 
@@ -83,10 +94,18 @@ def test_snapshot_labels_networks_and_carries_the_core_fields(net):
     t = s.to_state_text()
     assert (s.signals_network, s.execution_network, s.degraded) == ("mainnet", "testnet", False)
     for line in ("signals_network: mainnet", "execution_network: testnet", "pyth_price: 4126.30", "pyth_confidence: 0.1600",
-                 "hl_mark: 4126.50", "funding_rate_annualized: 0.0548", "spread_bps:", "depth_buy_within_0.5pct_oz:",
-                 "change_24h_pct:", "realized_vol_7d_annualized:", "testnet_depth_sell_within_0.5pct_oz:", "maintenance_ratio: 10.833",
+                 "hl_mark: 4126.50", "funding_rate_annualized: 5.48%", "spread_bps:", "depth_buy_within_0.5pct_oz:",
+                 "change_24h_pct:", "vol_ratio_24h_7d:", "move_1h_sigmas:", "hourly_sigma_pct:", "mark_vs_pyth_bps: 0.5",
+                 "testnet_depth_sell_within_0.5pct_oz:", "maintenance_ratio: 10.833", "equity_to_required_ratio: 0.79",
                  "distance_to_liquidation_pct: 30.86", "[calendar]"):
         assert line in t, line
+    assert re.search(r"realized_vol_24h_annualized: \d+\.\d\d%", t) and re.search(r"realized_vol_7d_annualized: \d+\.\d\d%", t)
+
+
+def test_the_testnet_figures_are_kept_but_labelled_as_not_a_market_signal(net):
+    t = build_snapshot(M, None, NOW).to_state_text()
+    assert "[execution venue (not a market signal)]" in t and "\n[execution]" not in t
+    assert "testnet_mark: 4135.40" in t and "testnet_mark_vs_pyth_bps:" in t  # still in the record
 
 
 def test_a_market_only_snapshot_has_no_strategy_section(net):
@@ -125,12 +144,61 @@ def test_empty_book_is_reported_not_guessed(net):
     assert build_snapshot(M, None, NOW).absent["book"] == "order book empty or unreadable"
 
 
+def test_an_outlier_gold_market_is_excluded_from_the_text_and_listed_with_its_reason(net):
+    s = build_snapshot(M, None, NOW)
+    t = s.to_state_text()
+    assert "flx:GOLD_mark: 4150.00" in t  # 0.6% from Pyth: context for Jev
+    assert "hyna" not in t and "4993" not in t and "outside 1.5%" not in t  # never shown to Jev, mark included
+    assert s.excluded_markets == [{"market": "hyna:GOLD", "mark": D("4993.2"), "reason": "outside 1.5% of Pyth"}]
+
+
+def test_the_1_5_percent_boundary(net):
+    OTHER_MARKS["flx:GOLD"] = str((D("4126.3") * D("1.015")).quantize(D("0.01")))  # 4188.19: just inside
+    assert "flx:GOLD_mark" in build_snapshot(M, None, NOW).to_state_text()
+    OTHER_MARKS["flx:GOLD"] = str((D("4126.3") * D("1.0151")).quantize(D("0.01")))  # just outside
+    s = build_snapshot(M, None, NOW)
+    assert "flx" not in s.to_state_text() and {e["market"] for e in s.excluded_markets} == {"flx:GOLD", "hyna:GOLD"}
+    OTHER_MARKS["flx:GOLD"] = "4150.0"
+
+
+def test_venue_divergence_reads_the_mainnet_mark_vs_pyth_only(net):
+    OTHER_MARKS["flx:GOLD"] = "4400.0"  # a wild other market: excluded, and never the trigger anyway
+    try:
+        s = build_snapshot(M, None, NOW)
+        assert rules_signals.answer(s, ["venue_price_divergence"])["venue_price_divergence"] == D("0.05")  # 0.5 bps
+        s.sections["cross_venue"] = {"flx:GOLD_mark": "9999.00"}  # absurd context changes nothing
+        s.sections["execution"]["testnet_mark_vs_pyth_bps"] = "250.0"  # the execution venue is not a market signal: ignored
+        assert rules_signals.answer(s, ["venue_price_divergence"])["venue_price_divergence"] == D("0.05")
+        s.sections["venue"]["mark_vs_pyth_bps"] = "-16.0"  # the mainnet mark itself diverging is what triggers (absolute value)
+        assert rules_signals.answer(s, ["venue_price_divergence"])["venue_price_divergence"] >= D("0.9")
+    finally:
+        OTHER_MARKS["flx:GOLD"] = "4150.0"
+
+
+def test_paxg_funding_is_a_per_hour_reference_when_listed_and_skipped_when_not(net):
+    t = build_snapshot(M, None, NOW).to_state_text()
+    assert "paxg_perp_funding_hourly_BinPerp: 0.00001000" in t  # 4h rate 0.00004 -> per hour
+    assert "paxg_perp_funding_hourly_HlPerp: 0.00001250" in t
+    PAXG_LISTED["on"] = False
+    try:
+        t = build_snapshot(M, None, NOW).to_state_text()
+        assert "paxg_perp" not in t
+    finally:
+        PAXG_LISTED["on"] = True
+
+
+def test_absent_signals_carry_the_agreed_reasons(net):
+    t = build_snapshot(M, None, NOW).to_state_text()
+    assert "predicted_funding_xyz: HIP-3 market not covered by predictedFundings" in t
+    assert "paxg_jupiter: mint not verified" in t
+
+
 def test_extras_failures_return_reasons_never_raise(monkeypatch):
     monkeypatch.setattr(httpx, "get", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("x")))
     v, why = extras.pyth_history("ab" * 32, 1_790_000_000)
     assert v is None and "unavailable" in why
     monkeypatch.setattr(hl_readonly, "info", lambda *a, **k: (_ for _ in ()).throw(hl_readonly.SignalsReadError("x")))
-    v, why = extras.cross_venue("xyz:GOLD")
+    v, why = extras.cross_venue("xyz:GOLD", D(4126))
     assert v is None and "unavailable" in why
 
 
@@ -320,40 +388,108 @@ def test_jev_answers_are_used_when_available(net, key):
 
 
 def test_jev_failure_falls_back_to_rules_and_says_so(net, key):
-    snap = build_snapshot(M, None, NOW)
+    snap = build_snapshot(M, None, NOW, size_oz=D("0.05"))
     net.setattr(jev, "ask", lambda *a, **k: (_ for _ in ()).throw(jev.JevError("down")))
     s = signals.get_signals(snap)
     assert s.source == "rules" and s.jev_error == "down" and s.question_set_version == QUESTION_SET_VERSION
-    assert set(s.probabilities) == set(question_names(False)) and all(0 <= p <= 1 for p in s.probabilities.values())
+    assert set(s.probabilities) == set(question_names(snap)) and all(0 <= p <= 1 for p in s.probabilities.values())
 
 
 def test_question_registry_is_consistent():
-    assert NEEDS_STRATEGY <= set(MONITORING) and "high_impact_event_soon" in MONITORING
+    assert NEEDS_STRATEGY <= set(MONITORING) and "high_impact_event_soon" in MONITORING and QUESTION_SET_VERSION == "2026-10-08.2"
     assert set(SETUP) == {"volatility_elevated", "funding_favors_shorts", "liquidity_sufficient_for_size"}
-    assert set(question_names(True)) == set(MONITORING) and set(question_names(False)) == (set(MONITORING) - NEEDS_STRATEGY) | set(SETUP)
     for q in {**MONITORING, **SETUP}.values():
-        assert q["type"] == "noul" and q["instructions"].endswith("?") and set(q["criteria"]) == {"true", "false"}
+        assert q["type"] == "noul" and q["instructions"].endswith(".") and set(q["criteria"]) == {"true", "false"}
+        assert all(q["criteria"].values()) and re.search(r"\d", q["instructions"])  # a number to compare against, in every question
+
+
+FIELDS_READ = {  # question -> (state field names it names, a threshold phrase it must state)
+    "volatility_elevated": (["vol_ratio_24h_7d", "realized_vol_24h_annualized"], ["1.3", "30%"]),
+    "venue_price_divergence": (["mark_vs_pyth_bps"], ["15", "[execution venue (not a market signal)]"]),
+    "funding_favors_shorts": (["funding_rate_annualized"], ["+2%", "longs pay shorts"]),
+    "liquidity_sufficient_for_size": (["size_oz", "depth_to_size_ratio"], ["TESTNET", "2"]),
+    "liquidity_sufficient": (["size_oz", "depth_to_size_ratio"], ["TESTNET", "2"]),
+    "needs_top_up_soon": (["maintenance_ratio", "move_1h_sigmas"], ["1.5", "1.8"]),
+    "should_rebalance": (["gap_pct", "rebalance_band_pct", "size_notional_usd"], ["10.50"]),
+    "abnormal_price_move": (["move_1h_sigmas"], ["3"]),
+    "excess_margin_safe_to_return": (["maintenance_ratio", "equity_to_required_ratio"], ["3.0", "2.0"]),
+    "high_impact_event_soon": (["events_within_24h"], ["none"]),
+}
+
+
+def test_every_question_names_real_state_fields_and_states_its_threshold(net):
+    text = build_snapshot(M, {**STRATEGY, "hedge_gap_units": 0.02, "hedge_gap_bps": 1600}, NOW).to_state_text()
+    allq = {**MONITORING, **SETUP}
+    assert set(FIELDS_READ) == set(allq)
+    for name, (fields, phrases) in FIELDS_READ.items():
+        q = allq[name]
+        for f in fields:
+            assert f in q["instructions"] and f in q["criteria"]["true"] + q["criteria"]["false"] + q["instructions"], (name, f)
+            if f not in ("size_oz",) or "[sizing]" in text:
+                assert f"{f}:" in text, f"{name}: state has no field {f}"
+        for ph in phrases:
+            assert ph in q["instructions"] + q["criteria"]["true"] + q["criteria"]["false"], (name, ph)
 
 
 def test_rules_cover_every_question_with_sensible_directions(net):
-    healthy = rules_signals.answer(build_snapshot(M, STRATEGY, NOW), question_names(True))
+    gap = {**STRATEGY, "hedge_gap_units": 0.02, "hedge_gap_bps": 1600}  # a 16% gap: a real rebalance
+    snap = build_snapshot(M, gap, NOW)
+    healthy = rules_signals.answer(snap, question_names(snap))
     assert set(healthy) == set(MONITORING) and healthy["needs_top_up_soon"] < D("0.5") and healthy["excess_margin_safe_to_return"] < D("0.5")
-    weak = {**STRATEGY, "value_usd": 14.0, "hedge_gap_bps": 900, "hedge_gap_units": 0.02}  # ratio 1.17, gap 9% > 5% band
-    snap = build_snapshot(M, weak, NOW)
-    snap.sections["execution"]["testnet_depth_buy_within_0.5pct_oz"] = "0.0096"  # thinner than the 0.02 oz the rebalance needs
-    a = rules_signals.answer(snap, question_names(True))
-    assert a["needs_top_up_soon"] >= D("0.9") and a["should_rebalance"] >= D("0.9") and a["liquidity_sufficient"] <= D("0.1")
-    rich = {**STRATEGY, "value_usd": 500.0, "required_margin_usd": 100.0}  # ratio 41, equity 5x required
-    assert rules_signals.answer(build_snapshot(M, rich, NOW), ["excess_margin_safe_to_return"])["excess_margin_safe_to_return"] >= D("0.9")
+    assert healthy["should_rebalance"] >= D("0.9")  # gap 16% > 5% band and $82 of notional
+    weak = build_snapshot(M, {**gap, "value_usd": 14.0}, NOW)  # ratio 1.17
+    weak.sections["sizing"]["depth_to_size_ratio"] = "0.50"
+    a = rules_signals.answer(weak, question_names(weak))
+    assert a["needs_top_up_soon"] >= D("0.9") and a["liquidity_sufficient"] <= D("0.1")
+    rich = build_snapshot(M, {**gap, "value_usd": 500.0, "required_margin_usd": 100.0}, NOW)  # ratio 41.7, equity 5x required
+    assert rules_signals.answer(rich, ["excess_margin_safe_to_return"])["excess_margin_safe_to_return"] >= D("0.9")
     with pytest.raises(KeyError):
         rules_signals.answer(build_snapshot(M, None, NOW), ["not_a_question"])
 
 
-def test_rules_detect_divergence_and_events(net):
+@pytest.mark.parametrize("field,section,value,question,expected", [
+    ("vol_ratio_24h_7d", "volatility", "1.31", "volatility_elevated", "yes"), ("vol_ratio_24h_7d", "volatility", "1.30", "volatility_elevated", "no"),
+    ("realized_vol_24h_annualized", "volatility", "30.01%", "volatility_elevated", "yes"),
+    ("funding_rate_annualized", "venue", "2.01%", "funding_favors_shorts", "yes"), ("funding_rate_annualized", "venue", "0.99%", "funding_favors_shorts", "no"),
+    ("funding_rate_annualized", "venue", "1.50%", "funding_favors_shorts", "maybe"), ("funding_rate_annualized", "venue", "-3.00%", "funding_favors_shorts", "no"),
+    ("mark_vs_pyth_bps", "venue", "15.1", "venue_price_divergence", "yes"), ("mark_vs_pyth_bps", "venue", "-15.1", "venue_price_divergence", "yes"),
+    ("mark_vs_pyth_bps", "venue", "7.9", "venue_price_divergence", "no"), ("mark_vs_pyth_bps", "venue", "10.0", "venue_price_divergence", "maybe"),
+    ("move_1h_sigmas", "volatility", "3.01", "abnormal_price_move", "yes"), ("move_1h_sigmas", "volatility", "1.99", "abnormal_price_move", "no"),
+    ("move_1h_sigmas", "volatility", "2.50", "abnormal_price_move", "maybe"),
+])
+def test_rules_apply_exactly_the_thresholds_the_questions_state(net, field, section, value, question, expected):
     snap = build_snapshot(M, None, NOW)
-    assert rules_signals.answer(snap, ["venue_price_divergence"])["venue_price_divergence"] == D("0.05")  # 22 bps
-    snap.sections["execution"]["testnet_mark_vs_pyth_bps"] = "250.0"
-    assert rules_signals.answer(snap, ["venue_price_divergence"])["venue_price_divergence"] >= D("0.9")
+    snap.sections[section][field] = value
+    p = rules_signals.answer(snap, [question])[question]
+    assert {"yes": p >= D("0.9"), "no": p <= D("0.1"), "maybe": D("0.4") <= p <= D("0.6")}[expected], (field, value, p)
+
+
+def test_a_liquidity_question_is_only_asked_when_a_size_is_known_and_the_absence_is_reported(net):
+    none = build_snapshot(M, None, NOW)
+    assert "liquidity_sufficient_for_size" not in question_names(none) and "sizing" not in none.sections
+    assert none.absent["liquidity_sufficient_for_size"] == "no hedge size given"
+    assert "liquidity_sufficient_for_size: no hedge size given" in none.to_state_text()
+    sized = build_snapshot(M, None, NOW, size_oz=D("0.005"))
+    assert "liquidity_sufficient_for_size" in question_names(sized)
+    sec = sized.sections["sizing"]
+    assert sec["size_oz"] == "0.0050" and sec["side_to_trade"] == "sell" and sec["size_basis"].startswith("proposed hedge")
+    assert sec["testnet_depth_same_side_within_0.5pct_oz"] == "10.0000"  # the fake testnet book: bids within 0.5% of its mark are the 10 oz at 4126
+    assert sec["depth_to_size_ratio"] == "2000.00"
+    flat = build_snapshot(M, {**STRATEGY, "hedge_gap_units": 0.0}, NOW)
+    assert "liquidity_sufficient" not in question_names(flat) and "no rebalance needed" in flat.absent["liquidity_sufficient"]
+
+
+def test_the_rebalance_side_follows_the_sign_of_the_gap_and_uses_that_sides_depth(net):
+    under = build_snapshot(M, {**STRATEGY, "hedge_gap_units": 0.02}, NOW).sections["sizing"]  # short more: a sell, hits the bids
+    over = build_snapshot(M, {**STRATEGY, "hedge_gap_units": -0.02}, NOW).sections["sizing"]  # buy back: lifts the asks
+    assert (under["side_to_trade"], over["side_to_trade"]) == ("sell", "buy")
+    assert under["testnet_depth_same_side_within_0.5pct_oz"] != over["testnet_depth_same_side_within_0.5pct_oz"]
+    assert under["size_oz"] == over["size_oz"] == "0.0200" and under["size_notional_usd"] == "82.53"
+
+
+def test_rules_detect_events(net):
+    snap = build_snapshot(M, None, NOW)
+    assert rules_signals.answer(snap, ["high_impact_event_soon"])["high_impact_event_soon"] <= D("0.1")
     snap.sections["calendar"]["events_within_24h"] = "CPI release"
     assert rules_signals.answer(snap, ["high_impact_event_soon"])["high_impact_event_soon"] >= D("0.9")
 

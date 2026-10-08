@@ -69,23 +69,38 @@ def pyth_history(feed_id: str, now_s: int | None = None) -> tuple[dict | None, s
         return None, f"pyth history unavailable: {type(e).__name__}"
 
 
-def cross_venue(coin: str) -> tuple[dict | None, str | None]:
-    """predictedFundings for this coin across venues, plus the other HIP-3 gold markets' mark and funding (mainnet)."""
+MAX_GOLD_DEVIATION = Decimal("0.015")  # another venue's gold mark is context only while within 1.5% of Pyth
+PAXG_REASON = "mint not verified"
+PREDICTED_REASON = "HIP-3 market not covered by predictedFundings"
+
+
+def cross_venue(coin: str, pyth_px: Decimal | None) -> tuple[dict | None, str | None]:
+    """Cross-venue context for gold, never a trigger for any decision:
+    - funding: predictedFundings has no entry for HIP-3 markets such as xyz:GOLD, so the reference is the native PAXG perp's
+      entry (per venue, normalised to a per-hour rate), only if PAXG is listed in mainnet meta;
+    - other HIP-3 gold markets: included only when their mark is within 1.5% of the Pyth XAU price; the rest are returned in
+      `excluded` (with mark and reason) so they can be shown to people but are never rendered into the text Jev reads."""
     try:
+        paxg = {}
+        if any(u["name"] == "PAXG" for u in hl.info({"type": "meta"})["universe"]):  # one meta read; skipped if PAXG is not listed
+            for name, venues in hl.predicted_fundings():
+                if name == "PAXG":
+                    paxg = {v: Decimal(d["fundingRate"]) / Decimal(d.get("fundingIntervalHours") or 1) for v, d in venues if d}
         base = coin.split(":")[-1]
-        pf = {}
-        for name, venues in hl.predicted_fundings():
-            if name == base or name == coin:
-                pf = {v: Decimal(d["fundingRate"]) for v, d in venues if d}
-        others = {}
+        included, excluded = {}, []
         for dex in hl.perp_dexs():
-            if f"{dex}:{base}" == coin:
+            name = f"{dex}:{base}"
+            if name == coin:
                 continue
             try:
-                c = hl.asset_ctx(f"{dex}:{base}", dex)
-                others[f"{dex}:{base}"] = {"mark": Decimal(c["markPx"]), "funding": Decimal(c["funding"])}
+                c = hl.asset_ctx(name, dex)
             except hl.SignalsReadError:
                 continue
-        return {"predicted_funding": pf, "other_gold_markets": others}, None
+            mark, funding = Decimal(c["markPx"]), Decimal(c["funding"])
+            if pyth_px and abs(mark - pyth_px) / pyth_px <= MAX_GOLD_DEVIATION:
+                included[name] = {"mark": mark, "funding": funding}
+            else:
+                excluded.append({"market": name, "mark": mark, "reason": "outside 1.5% of Pyth" if pyth_px else "no Pyth price to compare"})
+        return {"paxg_funding_hourly": paxg, "included": included, "excluded": excluded}, None
     except Exception as e:
         return None, f"cross-venue reads unavailable: {type(e).__name__}"

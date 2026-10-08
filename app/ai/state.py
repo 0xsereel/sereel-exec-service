@@ -28,6 +28,14 @@ def fmt(x, places: int = 4) -> str:
     return s
 
 
+def pct(frac, places: int = 2) -> str:
+    """A fraction rendered as an explicit percent ('0.2156' -> '21.56%'), so the unit can never be guessed."""
+    return "n/a" if frac is None else fmt(D(str(frac)) * 100, places) + "%"
+
+
+SECTION_LABELS = {"execution": "execution venue (not a market signal)", "sizing": "sizing"}
+
+
 @dataclass
 class Snapshot:
     market_id: str
@@ -38,14 +46,15 @@ class Snapshot:
     sections: dict[str, dict[str, str]] = field(default_factory=dict)
     absent: dict[str, str] = field(default_factory=dict)  # signal -> why it is missing (never silently dropped)
     has_strategy: bool = False
+    excluded_markets: list[dict] = field(default_factory=list)  # for people only: NEVER rendered into the text Jev reads
 
     def to_state_text(self) -> str:
         lines = [f"market: {self.market_id}", f"as_of: {self.taken_at}", f"signals_network: {self.signals_network}",
                  f"execution_network: {self.execution_network}", f"degraded: {str(self.degraded).lower()}"]
-        for name in ("price", "venue", "book", "volatility", "execution", "calendar", "cross_venue", "strategy"):
+        for name in ("price", "venue", "book", "volatility", "sizing", "execution", "calendar", "cross_venue", "strategy"):
             sec = self.sections.get(name)
             if sec:
-                lines.append(f"[{name}]")
+                lines.append(f"[{SECTION_LABELS.get(name, name)}]")
                 lines += [f"{k}: {v}" for k, v in sec.items()]  # insertion order is fixed by build_snapshot
         if self.absent:
             lines.append("[unavailable]")
@@ -59,7 +68,7 @@ class Snapshot:
     def get(self, section: str, key: str) -> D | None:
         v = self.sections.get(section, {}).get(key)
         try:
-            return None if v in (None, "n/a") else D(v)
+            return None if v in (None, "n/a") else D(v.rstrip("%"))  # a "%" value is returned as the percent number (21.56%% -> 21.56)
         except Exception:
             return None
 
@@ -95,9 +104,10 @@ def _testnet_book(market: Market) -> dict | None:
     return {"mark": mark, "oracle": D(c["oraclePx"]), "buy_depth": _depth(asks, mark, True), "sell_depth": _depth(bids, mark, False)}
 
 
-def build_snapshot(market: Market, strategy: dict | None = None, now: datetime | None = None, events: list[dict] | None = None) -> Snapshot:
+def build_snapshot(market: Market, strategy: dict | None = None, now: datetime | None = None, events: list[dict] | None = None,
+                   size_oz: Decimal | None = None) -> Snapshot:
     """`strategy` is the serialized strategy (as GET /strategies/{id} returns it, with `value_usd` from /value merged in as
-    `value_usd`), or None for a market-only snapshot. Every read that can fail is isolated: it lands in `absent` with a reason."""
+    `value_usd`), or None for a market-only snapshot. `size_oz` is a PROPOSED hedge size (setup), judged against testnet depth. Every read that can fail is isolated: it lands in `absent` with a reason."""
     now = now or datetime.now(timezone.utc)
     now_s = int(now.timestamp())
     network = settings.signals_source_network
@@ -140,7 +150,7 @@ def build_snapshot(market: Market, strategy: dict | None = None, now: datetime |
         funding = D(ctx["funding"])
         snap.sections["venue"] = {
             "hl_mark": fmt(mark, 2), "hl_oracle": fmt(ctx["oraclePx"], 2), "funding_rate_hourly": fmt(funding, 8),
-            "funding_rate_annualized": fmt(funding * HOURS_PER_YEAR, 4), "open_interest_oz": fmt(ctx["openInterest"], 2),
+            "funding_rate_annualized": pct(funding * HOURS_PER_YEAR), "open_interest_oz": fmt(ctx["openInterest"], 2),
             "mark_vs_pyth_bps": fmt((mark - pyth_px) / pyth_px * 10_000, 1) if pyth_px else "n/a"}
         if book and book[0] and book[1]:
             mid = (D(book[0][0]["px"]) + D(book[1][0]["px"])) / 2
@@ -152,11 +162,16 @@ def build_snapshot(market: Market, strategy: dict | None = None, now: datetime |
             absent["book"] = "order book empty or unreadable"
     if closes:
         last = closes[-1]
+        v24, v7 = realized_vol(closes[-25:]), realized_vol(closes[-169:])
+        ch1 = _pct_change(last, closes[-2]) if len(closes) > 1 else None
+        sigma_h = v24 / D(str(HOURS_PER_YEAR)).sqrt() * 100 if v24 else None  # one hour's 1-sigma move, in percent
         snap.sections["volatility"] = {
-            "change_1h_pct": fmt(_pct_change(last, closes[-2]) if len(closes) > 1 else None, 3),
+            "change_1h_pct": fmt(ch1, 3),
             "change_24h_pct": fmt(_pct_change(last, closes[-25]) if len(closes) > 24 else None, 3),
-            "realized_vol_24h_annualized": fmt(realized_vol(closes[-25:]), 4),
-            "realized_vol_7d_annualized": fmt(realized_vol(closes[-169:]), 4)}
+            "realized_vol_24h_annualized": pct(v24), "realized_vol_7d_annualized": pct(v7),
+            "vol_ratio_24h_7d": fmt(v24 / v7, 2) if v24 and v7 else "n/a",
+            "hourly_sigma_pct": fmt(sigma_h, 4),
+            "move_1h_sigmas": fmt(abs(ch1) / sigma_h, 2) if ch1 is not None and sigma_h else "n/a"}
     else:
         absent["volatility"] = "no candles"
 
@@ -182,17 +197,20 @@ def build_snapshot(market: Market, strategy: dict | None = None, now: datetime |
         snap.sections["price"].update({f"pyth_change_{k}_pct": fmt(_pct_change(pyth_px, v), 3) for k, v in hist.items()})
     elif not hist:
         absent["pyth_history"] = why
-    cv, why = extras.cross_venue(market.hl_coin)
+    absent["predicted_funding_xyz"] = extras.PREDICTED_REASON  # honest: predictedFundings does not list HIP-3 markets
+    absent["paxg_jupiter"] = extras.PAXG_REASON  # dropped: no verified Solana mint, so no onchain gold cross-check
+    cv, why = extras.cross_venue(market.hl_coin, pyth_px)
     if cv:
         sec = {}
-        for v, rate in sorted(cv["predicted_funding"].items()):
-            sec[f"predicted_funding_{v}"] = fmt(rate, 8)
-        for name, o in sorted(cv["other_gold_markets"].items()):
-            sec[f"{name}_mark"], sec[f"{name}_funding"] = fmt(o["mark"], 2), fmt(o["funding"], 8)
+        for v, rate in sorted(cv["paxg_funding_hourly"].items()):
+            sec[f"paxg_perp_funding_hourly_{v}"] = fmt(rate, 8)
+        for name, o in sorted(cv["included"].items()):
+            sec[f"{name}_mark"], sec[f"{name}_funding_hourly"] = fmt(o["mark"], 2), fmt(o["funding"], 8)
+        snap.excluded_markets = cv["excluded"]
         if sec:
             snap.sections["cross_venue"] = sec
         else:
-            absent["cross_venue"] = "no cross-venue data returned"
+            absent["cross_venue"] = "no cross-venue data included"
     else:
         absent["cross_venue"] = why
 
@@ -210,10 +228,40 @@ def build_snapshot(market: Market, strategy: dict | None = None, now: datetime |
             "equity_usd": fmt(equity, 2), "maintenance_margin_usd": fmt(maint, 4),
             "maintenance_ratio": fmt(equity / maint, 3) if equity is not None and maint else "n/a",
             "required_margin_usd": fmt(strategy.get("required_margin_usd"), 2),
+            "equity_to_required_ratio": fmt(equity / D(str(strategy["required_margin_usd"])), 2)
+            if equity is not None and strategy.get("required_margin_usd") else "n/a",
             "distance_to_liquidation_pct": "n/a", "unrealized_pnl_usd": fmt(pos.get("unrealized_pnl_usd"), 4),
             "funding_paid_usd": fmt(pos.get("funding_paid_usd"), 4)}
         liq, mk = pos.get("liquidation_price_usd"), pos.get("mark_price_usd")
         if liq and mk:
             sec["distance_to_liquidation_pct"] = fmt(abs(D(str(liq)) - D(str(mk))) / D(str(mk)) * 100, 2)
         snap.sections["strategy"] = sec
+
+    _sizing(snap, strategy, size_oz)
     return snap
+
+
+def _sizing(snap: Snapshot, strategy: dict | None, size_oz: D | None) -> None:
+    """The size a liquidity question is about, the side it trades, and the TESTNET depth on that side (where orders execute).
+    No known size -> no sizing section, and the liquidity question is reported absent instead of being guessed."""
+    depth_sell = snap.get("execution", "testnet_depth_sell_within_0.5pct_oz")  # a sell hits the bids
+    depth_buy = snap.get("execution", "testnet_depth_buy_within_0.5pct_oz")
+    if strategy is not None:
+        gap = D(str(strategy.get("hedge_gap_units") or 0))  # target short - current short: > 0 means sell more
+        if gap == 0:
+            snap.absent["liquidity_sufficient"] = "no rebalance needed (gap is zero), so no size to judge"
+            return
+        size, side, basis = abs(gap), "sell" if gap > 0 else "buy", "size of the rebalance needed"
+    elif size_oz is not None and size_oz > 0:
+        size, side, basis = size_oz, "sell", "proposed hedge (opening a short)"
+    else:
+        snap.absent["liquidity_sufficient_for_size"] = "no hedge size given"
+        return
+    depth = depth_sell if side == "sell" else depth_buy
+    mark = snap.get("venue", "hl_mark") or snap.get("price", "pyth_price")
+    snap.sections["sizing"] = {
+        "size_basis": basis, "size_oz": fmt(size, 4), "side_to_trade": side,
+        "size_notional_usd": fmt(size * mark, 2) if mark else "n/a",
+        "testnet_depth_same_side_within_0.5pct_oz": fmt(depth, 4),
+        "depth_to_size_ratio": fmt(depth / size, 2) if depth is not None else "n/a"}
+
