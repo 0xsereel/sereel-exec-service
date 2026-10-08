@@ -126,7 +126,7 @@ def test_a_within_band_or_no_op_rebalance_needs_no_book(api, fakechain):
     state.venue.liquidity = D(0)
     r, _ = rebalance(api, s["id"])  # already at target
     assert r.status_code == 200 and state.venue.orders[-1:] == state.venue.orders[:1]
-    patch(api, s["id"], {"target_exposure_units": "0.205"})  # 2.4% gap, inside the 5% band
+    patch(api, s["id"], {"target_exposure_units": "0.21"})  # 4.8% gap, inside the 5% band, and a viable ($15) trade if forced
     assert rebalance(api, s["id"])[0].status_code == 200
     forced, _ = rebalance(api, s["id"], force=True)  # force makes it a real trade: now the book matters
     assert forced.status_code == 409 and forced.json()["code"] == "NO_LIQUIDITY"

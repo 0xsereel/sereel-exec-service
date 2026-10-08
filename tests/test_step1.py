@@ -226,9 +226,9 @@ def test_a_gap_exactly_equal_to_the_band_does_not_trade_but_one_bp_more_does(api
 
 def test_force_trades_even_inside_the_band(api, fakechain):
     s = active(api, fakechain)
-    patch(api, s["id"], {"target_exposure_units": "0.205"})
+    patch(api, s["id"], {"target_exposure_units": "0.21"})  # target 0.126: a 4.8% gap, inside the band, and a $15 trade (viable)
     r, _ = rebalance(api, s["id"], force=True)
-    assert r.json()["position"]["size_units"] == 0.123 and r.json()["hedge_gap_units"] == pytest.approx(0)
+    assert r.json()["position"]["size_units"] == 0.126 and r.json()["hedge_gap_units"] == pytest.approx(0)
     assert actions(s["id"], "rebalance")[0].record["forced"] is True
 
 

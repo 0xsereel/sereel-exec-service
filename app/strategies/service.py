@@ -768,14 +768,40 @@ def _parse_edit(params: dict) -> tuple[int | None, Decimal | None]:
     return ratio, exposure
 
 
+def require_order_viable(st: Strategy, target_signed: Decimal, mark: Decimal, what: str, check_margin: bool = True) -> None:
+    """Before a signature is spent: would moving this strategy to `target_signed` be an order the venue accepts? It refuses
+    a trade worth less than the venue's minimum order (a full close to zero is exempt: it only reduces) and, when it grows
+    the short, one the strategy's own cash cannot margin. Nothing is sent and no nonce is burned."""
+    delta = target_signed - st.size
+    if delta == 0 or target_signed == 0:
+        return
+    notional, minimum = abs(delta) * mark, settings.min_order_usd * Decimal("1.05")  # cushion: the mark moves before the order
+    if notional < minimum:
+        need = (minimum / mark).quantize(Decimal("0.0001"), rounding="ROUND_UP")
+        raise _bad(f"{what} would trade {abs(delta).normalize():f} units (about ${notional:.2f}), below the venue's "
+                   f"${settings.min_order_usd} minimum order. Nothing was sent. A change of at least {need} units is needed; "
+                   f"make a larger change or leave the target where it is")
+    if check_margin and abs(target_signed) > abs(st.size):
+        cash = st.margin_usd + st.realized_pnl_usd + st.funding_usd - st.fees_usd
+        needed = abs(target_signed) * mark / st.leverage
+        if needed > cash:
+            raise ServiceError("INSUFFICIENT_MARGIN", f"a {abs(target_signed)} short at {st.leverage}x needs {needed:.2f} USD "
+                               f"but the strategy holds {cash:.2f}; add margin with a top-up first. Nothing was sent")
+
+
 def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strategy:
     """PATCH: change the hedge ratio and/or exposure. Moves the TARGET only; no order is sent (that is rebalance)."""
     ratio, exposure = _parse_edit(params)
     st = get_strategy(sid, org)
     if st.status != S_ACTIVE:
         raise ServiceError("CONFLICT", f"strategy is {st.status}; settings can only be edited while it is active", 409)
-    st, signer = authorize_action(sid, "edit_hedge_settings", authorization, params, org)
     mark = venue().mark_price(st.market_id)
+    new_target = (exposure if exposure is not None else st.target_exposure_units) * \
+        Decimal(ratio if ratio is not None else st.hedge_ratio_bps) / 10_000
+    gap_bps = int(abs(new_target + st.size) / new_target * 10_000) if new_target else 0  # st.size is negative for a short
+    if gap_bps > st.rebalance_band_bps:  # a rebalance would have to trade: make sure it could
+        require_order_viable(st, -new_target, mark, "moving to this target", check_margin=False)  # margin: the owner tops up after the edit
+    st, signer = authorize_action(sid, "edit_hedge_settings", authorization, params, org)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         before = {"hedge_ratio_bps": st.hedge_ratio_bps, "target_exposure_units": st.target_exposure_units,
@@ -823,6 +849,7 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
     gap0, gap_bps0 = hedge_gap(st)
     if abs(gap0) >= quantum0 and (force or gap_bps0 > st.rebalance_band_bps):  # a trade would happen: is there a book to take it?
         delta0 = -target_size(st) - st.size  # signed size the rebalance would trade: > 0 buys (shrinking a short), < 0 sells
+        require_order_viable(st, -target_size(st), v0.mark_price(st.market_id), "this rebalance")
         require_liquidity(st.market_id, delta0 > 0, abs(delta0), "this rebalance")
     st, signer = authorize_action(sid, "rebalance", authorization, {}, org)
     v = venue()
