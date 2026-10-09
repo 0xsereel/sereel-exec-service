@@ -54,6 +54,15 @@ class Settings(BaseSettings):
     agent_run_once_cooldown_s: int = 30  # a second run_once on the same strategy inside this returns the latest decision
     agent_exec_cap_s: int = 600  # at most one executed agent action per strategy in this window
     agent_exec_max_divergence_bps: Decimal = Decimal(50)  # execute is downgraded to propose when the execution venue is further from Pyth
+    # --- x402 paid data feed (devnet; settles straight to the customer's wallet through a public facilitator) ---
+    x402_facilitator_url: str = "https://x402.org/facilitator"
+    x402_network: str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"  # Solana devnet, CAIP-2
+    x402_usdc_mint: str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"  # Circle's devnet USDC: x402 only, NOT the service's own mock mint
+    x402_attestation_delay_s: int = 3600  # attestations of executed actions are sold only this long after they happen
+    x402_rate_per_min: int = 30  # per payer and per IP on the public route
+    x402_timeout_s: float = 10
+    x402_max_timeout_s: int = 60  # how long a signed payment stays valid (maxTimeoutSeconds)
+    public_url: str = ""  # the externally reachable base URL (e.g. the ngrok domain); empty = taken from the request
     chat_session_ttl_h: int = 24
     chat_max_messages: int = 30  # user messages per session
     chat_max_chars: int = 4000  # per message

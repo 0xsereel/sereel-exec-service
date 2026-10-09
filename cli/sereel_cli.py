@@ -13,6 +13,7 @@ from app.errors import ServiceError
 
 from . import setup
 from .agent import agent_app
+from .x402 import x402_app
 from .payouts import payouts_app
 from .strategies import strategies_app
 
@@ -22,6 +23,7 @@ app.add_typer(mm_app, name="mm")
 app.add_typer(payouts_app, name="payouts")
 app.add_typer(strategies_app, name="strategies")
 app.add_typer(agent_app, name="agent")
+app.add_typer(x402_app, name="x402")
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 FAUCET = "https://faucet.solana.com"

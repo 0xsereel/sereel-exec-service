@@ -575,6 +575,10 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `SIGNALS_UNAVAILABLE` | 503 | the agent could not read enough market data (neither Pyth nor Hyperliquid) to take a decision this cycle |
 | `DELEGATE_LIMIT_EXCEEDED` | 403 | a delegate's rebalance would exceed the limits the owner signed (daily size, or a forced rebalance on a band-only grant) |
 | `DELEGATE_NOT_ALLOWED` | 403 | the signer is a delegate but this action is not allowed for delegates (only rebalance is), or its grant has expired or been revoked |
+| `DATA_FEED_DISABLED` | 404 | no data feed is available for that id (disabled or unknown: the answer is identical, so nothing about a strategy leaks) |
+| `PAYMENT_INVALID` | 402 | the x402 payment was not accepted (missing, malformed, underpaid, replayed or rejected by the facilitator) |
+| `FACILITATOR_UNAVAILABLE` | 503 | the x402 facilitator could not be reached, so a payment could be neither verified nor settled; nothing was charged by the service |
+| `RATE_LIMITED` | 429 | too many requests to the public data-feed route from this payer or address |
 | `AGENT_DISABLED` | 503 | the AI agent is switched off (AGENT_ENABLED=false) |
 | `LLM_UNAVAILABLE` | 503 | the language model could not be reached or is not configured; the chat cannot respond (use the manual form) |
 | `CHAT_SESSION_EXPIRED` | 410 | the chat session is older than 24 hours; start a new one |
@@ -765,4 +769,49 @@ filled) ends `failed`, with the reason; a trade that did happen ends `executed`,
 triggered it: `sr` = should_rebalance, `ls` = liquidity_sufficient), `q` (the question-set version) and `m` (the Jev model id). The full
 record, including every probability, the decision id and the delegate's grant limits, is stored with the action and its hash `h` is
 in the memo, so the evidence is committed on-chain.
+
+## x402 data feed (Step 5: income paid to the customer)
+
+A customer can sell a read-only data feed about a strategy to third-party agents, per call, and be paid directly. It is **opt-in per
+strategy, off by default**: a new strategy exposes nothing until its owner signs `configure_data_feed`. **The service never receives or holds
+the money**: a buyer's payment is a Solana transfer straight to the customer's `pay_to` wallet, settled through a public x402 facilitator
+(`https://x402.org/facilitator`, which also pays the network fee, so a buyer needs no SOL).
+
+**Payment network.** Solana devnet (`solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1`), scheme `exact`, x402 v2. The token is **Circle's devnet USDC**
+(`4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`, from faucet.circle.com), used for x402 only: it is not the service's own mock `STABLECOIN_MINT`.
+Settings: `X402_FACILITATOR_URL`, `X402_NETWORK`, `X402_USDC_MINT`. The wire format was checked against the live facilitator's `/verify`.
+
+**The paid route** `GET /x402/strategies/{id}` (no `X-Sereel-Key`: public, rate-limited per address and per payer, `RATE_LIMITED`):
+- no payment: `402` with a `PAYMENT-REQUIRED` header (base64 JSON: price, the customer's `pay_to`, the Circle mint, the facilitator's fee payer) and an empty `{}` body;
+- with a `PAYMENT-SIGNATURE` header: the service checks the buyer signed for exactly our terms, asks the facilitator to **verify**, then **settle**, records the payment
+  and answers `200` with the enabled fields and a `PAYMENT-RESPONSE` header (the settlement transaction);
+- a disabled feed and an unknown id answer with the identical `404 DATA_FEED_DISABLED`, so nothing about a strategy leaks;
+- a payment that is missing, malformed, underpaid, for other terms, replayed or rejected is `402 PAYMENT_INVALID` with the fixed message "Payment was not accepted.";
+  a facilitator outage (verify or settle) is `503 FACILITATOR_UNAVAILABLE` and never `PAYMENT_INVALID`. The requirements sent to the facilitator are always the
+  service's own, never the buyer's claim. The same transaction is handled once (two-minute guard), and the settlement signature is unique in the ledger.
+
+**What is sold: post-trade, verified data only.** Fields (a comma-separated subset, default all four): `nav_per_share` (hedged and unhedged, each with `as_of`),
+`nav_history` (published checkpoints), `hedge_summary` (`hedge_ratio_pct` and `hedged_share_of_exposure_pct`, percentages only), `attestations` (executed actions
+only, **withheld until `X402_ATTESTATION_DELAY_S` = 3600 s after execution**; do not lower it). The feed is built field by field from an allow-list, so a new internal
+field can never leak by default, and `hedge_summary` reflects the last *executed* trade (an edit that has not traded yet is not visible). **Never sold:** agent signals
+or probabilities, pending decisions or proposals, live position size, target size, pending rebalances, delegate grants, margin health, liquidation price. A test checks every
+sold response and the preview for all of them, by key and by value. Because of the delay and the checkpointed NAV, the feed lags real trading by design.
+
+**NAV.** The owner signs `publish_nav` (`POST /strategies/{id}/nav`, `{nav_per_share, unhedged_nav_per_share, as_of}`, positive decimal strings, ISO 8601 UTC `as_of`)
+right after Cantina writes a checkpoint. `as_of` may not be older than the latest stored checkpoint nor more than 30 s in the future. It is stored, attested on Solana,
+and served as `nav_per_share` / `nav_history`. Until a NAV exists the fields read `{"status": "unavailable", "reason": "..."}`, never a placeholder. A Solana fund reader
+(`fund_address`, from the funds feature) is not connected yet; `fund_address` is stored for when it is.
+
+**For Cantina** (`X-Sereel-Key`): `POST /strategies/{id}/data-feed` (owner-signed; body `{enabled: "true"|"false", price_usd, pay_to, fields, authorization}`; `pay_to`
+defaults to the owner's wallet, a multisig owner must give one), `GET /strategies/{id}/data-feed` (`enabled, price_usd, pay_to, fields, endpoint_url,
+total_income_usd, payment_count, last_paid_at, usdc_mint`), `GET .../data-feed/preview` (the exact JSON a buyer would get now; 404 if disabled),
+`GET .../data-feed/payments?limit=50` (`payer, amount_usd, mint, tx_signature, settled_at, fields_served`). Every strategy row gains `data_feed_enabled` and
+`data_income_usd`. `endpoint_url` uses `PUBLIC_URL` (set it to the ngrok domain) or the request's forwarded host.
+
+**Enabling creates the customer's token account** for the Circle mint if it is missing, paying the rent from the funding wallet (idempotent; a multisig vault is fine).
+It needs devnet SOL: the funding wallet's balance is logged at startup and named in the error. If it cannot be created the enable is refused and nothing is turned on, so a
+feed is never live with a `pay_to` that cannot be settled to. Delegates cannot configure the feed or publish NAV.
+
+**Try it as a buyer:** `sereel x402 buy <strategy_id> --keypair payer.json [--repeat 5 --interval 10]` requests, receives the 402, pays, retries, and prints the data and the
+settlement link; with `--repeat` the customer's income visibly accrues. The payer needs Circle devnet USDC in its own token account (no SOL).
 

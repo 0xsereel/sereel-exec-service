@@ -1104,6 +1104,15 @@ def position_out(st: Strategy, mark: Decimal | None) -> dict | None:
             "hl_order_ids": list(st.hl_order_ids or [])}
 
 
+def data_feed_fields(strategy_id: str) -> dict:
+    """data_feed_enabled (bool) and data_income_usd (decimal string): the opt-in switch and what the feed has earned the customer."""
+    from ..x402 import feed
+
+    cfg = feed.config(strategy_id)
+    total, _, _ = feed.income(strategy_id)
+    return {"data_feed_enabled": bool(cfg and cfg.enabled), "data_income_usd": feed.money_str(total)}
+
+
 def strategy_out(st: Strategy) -> dict:
     mark = mark_for(st.market_id)
     size = target_size(st)
@@ -1126,6 +1135,7 @@ def strategy_out(st: Strategy) -> dict:
         "market_closed": bool(venue().market_closed.get(st.market_id, False)), "failure_reason": st.failure_reason,
         "hedge_gap_units": num(gap_units), "hedge_gap_bps": gap_bps,  # target short minus current short; > 0 = under-hedged
         "agent_mode": decisions.agent_mode(st.id), "has_unread_proposal": decisions.has_unread_proposal(st.id),
+        **data_feed_fields(st.id),
     }
 
 

@@ -34,7 +34,7 @@ from .models import Strategy, UsedNonce, now
 log = logging.getLogger("sereel.auth")
 PREFIX, NETWORK = "sereel-strategy-v1", "solana"
 ACTIONS = ("return_excess", "close_strategy", "rebalance", "edit_hedge_settings", "change_owner", "dismiss_decision", "run_once",
-           "grant_delegate", "revoke_delegate")
+           "grant_delegate", "revoke_delegate", "configure_data_feed", "publish_nav")
 NONCE_TTL_S = 120  # anything older than the 60s age limit is already rejected; keep a margin
 
 
@@ -61,6 +61,14 @@ FIELD_TYPES = {
     "max_rebalance_oz_per_day": "decimal",
     "rebalance_within_band_only": "str",
     "expires_at": "str",
+    "enabled": "str",
+    "price_usd": "decimal",
+    "pay_to": "str",
+    "fields": "str",
+    "fund_address": "str",
+    "nav_per_share": "decimal",
+    "unhedged_nav_per_share": "decimal",
+    "as_of": "str",
 }
 
 

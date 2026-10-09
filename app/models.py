@@ -209,6 +209,41 @@ class Delegate(SQLModel, table=True):
     revoke_attestation_sig: str | None = None
 
 
+class DataFeed(SQLModel, table=True):
+    """Per-strategy x402 data feed configuration. Absent or `enabled=false` means nothing about the strategy is ever served."""
+    strategy_id: str = Field(primary_key=True)
+    enabled: bool = False
+    price_usd: str | None = None  # as signed, e.g. "0.01"
+    pay_to: str | None = None  # the customer's wallet: payments settle straight to it
+    fields: str = ""  # comma-separated subset of the sellable fields
+    fund_address: str | None = None  # a Solana fund this strategy hedges (NAV source, once that reader exists)
+    updated_at: datetime = Field(default_factory=now)
+
+
+class DataPayment(SQLModel, table=True):
+    """One settled x402 payment. tx_signature is UNIQUE, so a replayed payment is recorded (and served) once."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    payer: str
+    amount_usd: Decimal = money()
+    mint: str
+    tx_signature: str = Field(unique=True)
+    settled_at: datetime = Field(default_factory=now, index=True)
+    fields_served: str = ""
+
+
+class NavCheckpoint(SQLModel, table=True):
+    """A NAV the owner published (signed, attested). The feed's NAV figures come from here and nowhere else."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    nav_per_share: str  # as signed
+    unhedged_nav_per_share: str
+    as_of: datetime = Field(index=True)
+    published_by: str = ""
+    attestation_sig: str | None = None
+    created_at: datetime = Field(default_factory=now)
+
+
 class Withdrawal(SQLModel, table=True):
     """Return-excess and close share this state machine."""
     id: str = Field(default_factory=new_id, primary_key=True)
