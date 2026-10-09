@@ -14,9 +14,10 @@ from .. import solana_client as sol
 from ..config import settings
 from ..db import engine
 from ..errors import ServiceError
+from . import custody
 from ..models import Action, DataFeed, DataPayment, NavCheckpoint, Strategy, now
 
-SELLABLE = ("nav_per_share", "nav_history", "hedge_summary", "attestations")
+SELLABLE = ("nav_per_share", "nav_history", "hedge_summary", "attestations", "custody_proof")
 # executed, post-trade events only. Edits, grants, decisions, owner changes and ledger notes are not on this list on purpose.
 EXECUTED_ACTIONS = ("deploy", "deposit", "rebalance", "return_excess", "close", "publish_nav")
 NEVER_EXPOSE = ("signals", "probabilities", "decision", "decisions", "proposal", "proposals", "position", "size_units", "target_size",
@@ -112,8 +113,10 @@ def build(strategy_id: str, fields: list[str], at: datetime | None = None) -> di
             {"status": "available", "hedged": cp.nav_per_share, "unhedged": cp.unhedged_nav_per_share, "as_of": iso(cp.as_of)}
     if "nav_history" in fields:
         cps = _checkpoints(strategy_id, HISTORY_LIMIT)
+        with_proof = "custody_proof" in fields  # each checkpoint carries its own proof when that field is on
         out["nav_history"] = _unavailable("no NAV has been published for this strategy yet") if not cps else \
-            {"status": "available", "checkpoints": [{"as_of": iso(c.as_of), "hedged": c.nav_per_share, "unhedged": c.unhedged_nav_per_share} for c in cps]}
+            {"status": "available", "checkpoints": [{"as_of": iso(c.as_of), "hedged": c.nav_per_share, "unhedged": c.unhedged_nav_per_share,
+                                                    **({"custody_proof": custody.served(c.custody_proof)} if with_proof else {})} for c in cps]}
     if "hedge_summary" in fields:
         ratio, exposure, held = executed_settings(strategy_id)
         share = (held / exposure * 100) if exposure else Decimal(0)
@@ -127,6 +130,10 @@ def build(strategy_id: str, fields: list[str], at: datetime | None = None) -> di
             items = [{"action": a.action, "at": iso(a.created_at), "attestation_sig": a.attestation_sig, "explorer_url": sol.explorer_url(a.attestation_sig)}
                      for a in rows]
         out["attestations"] = {"delay_s": delay, "items": items}
+    if "custody_proof" in fields:
+        cp = latest_checkpoint(strategy_id)  # only a PUBLISHED checkpoint can have a proof, and it is always the latest one's
+        out["custody_proof"] = _unavailable("no NAV has been published for this strategy yet") if cp is None and custody.source() is not None \
+            else custody.unavailable() if cp is None else custody.served(cp.custody_proof)
     return out
 
 

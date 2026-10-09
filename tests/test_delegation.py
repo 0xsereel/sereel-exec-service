@@ -213,7 +213,8 @@ def test_a_delegate_cannot_do_anything_but_rebalance(api, fakechain, what):
     assert r.status_code == 403 and r.json()["code"] == "DELEGATE_NOT_ALLOWED", (what, r.text)
     assert "may only sign `rebalance`" in r.json()["error"]
     after = get(api, sid)
-    assert {k: after[k] for k in ("owner_pubkey", "hedge_ratio_bps", "status", "position")} == {k: before[k] for k in ("owner_pubkey", "hedge_ratio_bps", "status", "position")}
+    stable = lambda r: {**{k: r[k] for k in ("owner_pubkey", "hedge_ratio_bps", "status")}, **{k: r["position"][k] for k in ("size_units", "margin_usd")}}  # noqa: E731
+    assert stable(after) == stable(before)  # not the whole position: funding and P&L tick with time
 
 
 def test_a_key_with_no_grant_is_not_a_delegate_it_is_just_not_the_owner(api, fakechain):

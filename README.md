@@ -597,9 +597,43 @@ Notes:
   or Pyth is unreachable". The `PRICE_DEVIATION` check still applies against that last price.
 - `UNKNOWN_MARKET` is 404 from the venue lookup and 400 when a request names an unknown market in its body.
 
-## AI agent (Step 1: signals)
+## AI agent: overview
 
-The AI layer only ever reads and proposes; no model can move money. Step 1 is the data layer and the Jev client.
+The AI layer proposes and explains; plain code decides parameters; only the owner (or a delegate within limits the owner signed) can act. Sections below go into detail.
+
+| Component | Job | Can it move money? |
+|---|---|---|
+| Data layer (`app/ai/state.py`) | one deterministic snapshot of the market and a strategy (Pyth, Hyperliquid mainnet signals, testnet depth, calendar) | No |
+| Jev (via the ngrok AI Gateway) | answers fixed yes/no risk questions with probabilities (falls back to the rules engine if unavailable) | No |
+| Decision rules (`app/ai/decide.py`) | maps probabilities and state to one action with exact parameters | No: it only proposes |
+| DeepSeek (any OpenAI-compatible model) | runs the setup conversation and writes explanations | No: its output never sets a parameter |
+| Delegate check (`auth.authorize`, `app/delegates.py`) | lets the agent's key sign `rebalance` within the owner's signed limits | Only that rebalance |
+| Data feed (`app/x402/`) | sells post-trade, verified data per call; the customer is paid directly | No: the service never holds the payment |
+
+**Safety rules.** The model never chooses a number that reaches the venue: numbers come from validated user answers or the rules, and model text is stored, never parsed.
+Every mutating action is a signed message from the owner; a delegate can sign `rebalance` only, inside limits the server enforces on every request. Money movements
+(top-ups, returns of excess margin, withdrawals) are never delegated and never executed by the agent. Nothing about a strategy is sold until its owner opts in, and what is
+sold is an allow-list of post-trade data. Simulated custody proofs are labelled simulated everywhere and never attested.
+
+**Endpoints** (all `X-Sereel-Key` unless marked public): `POST /agent/chat`, `GET /agent/chat/{id}`; `GET /agent/status`; `POST /agent/run-once` (owner-signed);
+`GET /strategies/{id}/agent/decisions`, `POST /strategies/{id}/agent/decisions/{did}/dismiss` (owner-signed); `GET`/`POST /strategies/{id}/delegates`,
+`DELETE /strategies/{id}/delegates/{pubkey}` (owner-signed); `GET`/`POST /strategies/{id}/data-feed`, `GET .../data-feed/preview`, `GET .../data-feed/payments`;
+`POST /strategies/{id}/nav` (owner-signed); and the **public, paid** `GET /x402/strategies/{id}`. Signed actions added: `dismiss_decision`, `run_once`, `grant_delegate`,
+`revoke_delegate`, `configure_data_feed`, `publish_nav` (all-string params, like the others).
+
+**Settings** (all in `.env.example`; everything is off or inert by default): `AGENT_ENABLED`, `AGENT_INTERVAL_S`, `AGENT_ACT_THRESHOLD`, `AGENT_SUGGEST_THRESHOLD`,
+`AGENT_RUN_ONCE_COOLDOWN_S`, `AGENT_EXEC_CAP_S`, `AGENT_EXEC_MAX_DIVERGENCE_BPS`, `AGENT_KEYPAIR`; `SIGNALS_SOURCE_NETWORK`, `SIGNALS_HL_URL`; `JEV_BASE_URL`, `JEV_API_KEY`,
+`JEV_MODEL`, `JEV_AUTH_HEADER`, `JEV_TIMEOUT_S`; `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_MAX_TOKENS`, `LLM_TIMEOUT_S`; `CHAT_SESSION_TTL_H`, `CHAT_MAX_MESSAGES`,
+`CHAT_MAX_CHARS`, `CHAT_RATE_PER_MIN`; `X402_FACILITATOR_URL`, `X402_NETWORK`, `X402_USDC_MINT`, `X402_ATTESTATION_DELAY_S`, `X402_RATE_PER_MIN`, `PUBLIC_URL`;
+`CUSTODY_PROOF_MODE`. Keys live in `.env` only and are never logged. Tools: `sereel agent signals`, `sereel agent calibrate`, `sereel agent key`, `sereel x402 buy`.
+
+**Error codes added by the AI layer and the feed** (full table under "Error codes"): `AGENT_DISABLED` 503, `LLM_UNAVAILABLE` 503, `CHAT_SESSION_EXPIRED` 410, `CHAT_LIMIT_REACHED` 429,
+`SIGNALS_UNAVAILABLE` 503, `DELEGATE_LIMIT_EXCEEDED` 403, `DELEGATE_NOT_ALLOWED` 403, `DATA_FEED_DISABLED` 404, `PAYMENT_INVALID` 402, `FACILITATOR_UNAVAILABLE` 503,
+`RATE_LIMITED` 429 (the public data-feed route only).
+
+## AI agent: signals and Jev
+
+The data layer and the Jev client. Nothing here can move money.
 
 | Piece | Job |
 |---|---|
@@ -651,7 +685,7 @@ The AI layer only ever reads and proposes; no model can move money. Step 1 is th
 - **Not included:** PAXG/Oro on Solana via Jupiter (reported as absent: "mint not verified"; a guessed mint would price the wrong token).
 - **Try it:** `sereel agent signals [--size-oz 0.05]` (market only; the size enables the liquidity question) or `sereel agent signals --strategy <id>` (needs `sereel serve` running).
 
-## AI agent (Step 2: setup assistant)
+## AI agent: setup assistant
 
 `POST /agent/chat` turns "I need a delta neutral hedge on gold" into a validated strategy **draft**. It never deploys: Cantina runs the
 normal signed deploy with the draft's values. Needs `AGENT_ENABLED=true` and an OpenAI-compatible model (`LLM_BASE_URL`, `LLM_API_KEY`,
@@ -682,7 +716,7 @@ normal signed deploy with the draft's values. Needs `AGENT_ENABLED=true` and an 
   `LLM_UNAVAILABLE` and **nothing is stored** for that turn, so Cantina can fall back to the manual form.
 - **Unsupported requests** (another asset, covered calls) return `status: "unsupported"` with what is available.
 
-## AI agent (Step 3: decisions, the monitoring loop, the feed)
+## AI agent: decisions, the monitoring loop and the feed
 
 With `AGENT_ENABLED=true` a job runs every `AGENT_INTERVAL_S` (60 for a demo, 300 in production): for each **active** strategy it builds
 a snapshot, asks Jev (or the rules fallback), decides with plain code, has the model explain it, and stores one decision. **Nothing here
@@ -728,7 +762,7 @@ once a delegate grant exists) and `has_unread_proposal` (a suggestion or proposa
 
 `SIGNALS_UNAVAILABLE` (503) is returned by `run_once` when neither Pyth nor Hyperliquid could be read.
 
-## AI agent (Step 4: delegation and the autonomous rebalance)
+## AI agent: delegation and the autonomous rebalance
 
 An owner can let the agent rebalance a strategy on its own, within limits the owner signs. Nothing else is ever delegated.
 
@@ -770,7 +804,7 @@ triggered it: `sr` = should_rebalance, `ls` = liquidity_sufficient), `q` (the qu
 record, including every probability, the decision id and the delegate's grant limits, is stored with the action and its hash `h` is
 in the memo, so the evidence is committed on-chain.
 
-## x402 data feed (Step 5: income paid to the customer)
+## x402 data feed (income paid to the customer)
 
 A customer can sell a read-only data feed about a strategy to third-party agents, per call, and be paid directly. It is **opt-in per
 strategy, off by default**: a new strategy exposes nothing until its owner signs `configure_data_feed`. **The service never receives or holds
@@ -790,9 +824,9 @@ Settings: `X402_FACILITATOR_URL`, `X402_NETWORK`, `X402_USDC_MINT`. The wire for
   a facilitator outage (verify or settle) is `503 FACILITATOR_UNAVAILABLE` and never `PAYMENT_INVALID`. The requirements sent to the facilitator are always the
   service's own, never the buyer's claim. The same transaction is handled once (two-minute guard), and the settlement signature is unique in the ledger.
 
-**What is sold: post-trade, verified data only.** Fields (a comma-separated subset, default all four): `nav_per_share` (hedged and unhedged, each with `as_of`),
+**What is sold: post-trade, verified data only.** Fields (a comma-separated subset, default all five): `nav_per_share` (hedged and unhedged, each with `as_of`),
 `nav_history` (published checkpoints), `hedge_summary` (`hedge_ratio_pct` and `hedged_share_of_exposure_pct`, percentages only), `attestations` (executed actions
-only, **withheld until `X402_ATTESTATION_DELAY_S` = 3600 s after execution**; do not lower it). The feed is built field by field from an allow-list, so a new internal
+only, **withheld until `X402_ATTESTATION_DELAY_S` = 3600 s after execution**; do not lower it), and `custody_proof` (below). The feed is built field by field from an allow-list, so a new internal
 field can never leak by default, and `hedge_summary` reflects the last *executed* trade (an edit that has not traded yet is not visible). **Never sold:** agent signals
 or probabilities, pending decisions or proposals, live position size, target size, pending rebalances, delegate grants, margin health, liquidation price. A test checks every
 sold response and the preview for all of them, by key and by value. Because of the delay and the checkpointed NAV, the feed lags real trading by design.
@@ -801,6 +835,16 @@ sold response and the preview for all of them, by key and by value. Because of t
 right after Cantina writes a checkpoint. `as_of` may not be older than the latest stored checkpoint nor more than 30 s in the future. It is stored, attested on Solana,
 and served as `nav_per_share` / `nav_history`. Until a NAV exists the fields read `{"status": "unavailable", "reason": "..."}`, never a placeholder. A Solana fund reader
 (`fund_address`, from the funds feature) is not connected yet; `fund_address` is stored for when it is.
+
+**Custody proofs are simulated until zkTLS bank attestations are live.** `custody_proof` answers one yes/no question for a *published* NAV checkpoint: does the
+custodian's cash balance cover the reported fund NAV (`claim`, `claim_holds`, `covers_nav_as_of`, `proof_id`, `proof_hash`, `generated_at`). With `CUSTODY_PROOF_MODE=off`
+(the default) the field reads `{"status": "unavailable", "reason": "custody proof source not configured"}`. With `CUSTODY_PROOF_MODE=simulated` the service generates a
+deterministic **demonstration** proof when a `publish_nav` checkpoint is stored (`proof_id` = `sim-` plus the first 12 hex of sha256(strategy id + `as_of`), `claim_holds`
+always true); every simulated proof says `"mode": "simulated"` and carries the note "Simulated proof for demonstration. Not a real bank attestation." It is not a bank
+attestation, it is **never written into a Solana attestation memo** (or the attested record), and nothing in the API or this README treats it as verified. A proof exists only
+for a checkpoint that is already published, never before or ahead of the NAV; `nav_history` entries each carry their own when the field is enabled. When real zkTLS proofs
+exist (a future `verified` mode behind the `CustodyProofSource` interface in `app/x402/custody.py`), a proof will show only whether the claim holds, never a balance, an account
+number or any other bank data; the simulated one has no such fields either.
 
 **For Cantina** (`X-Sereel-Key`): `POST /strategies/{id}/data-feed` (owner-signed; body `{enabled: "true"|"false", price_usd, pay_to, fields, authorization}`; `pay_to`
 defaults to the owner's wallet, a multisig owner must give one), `GET /strategies/{id}/data-feed` (`enabled, price_usd, pay_to, fields, endpoint_url,

@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     x402_usdc_mint: str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"  # Circle's devnet USDC: x402 only, NOT the service's own mock mint
     x402_attestation_delay_s: int = 3600  # attestations of executed actions are sold only this long after they happen
     x402_rate_per_min: int = 30  # per payer and per IP on the public route
+    custody_proof_mode: str = "off"  # off | simulated. A real "verified" mode (zkTLS bank attestations) plugs into app/x402/custody.py later
     x402_timeout_s: float = 10
     x402_max_timeout_s: int = 60  # how long a signed payment stays valid (maxTimeoutSeconds)
     public_url: str = ""  # the externally reachable base URL (e.g. the ngrok domain); empty = taken from the request
@@ -90,6 +91,16 @@ class Settings(BaseSettings):
     api_key: str = ""
     cors_origins: str = ""
     database_url: str = "sqlite:///./service.db"
+
+    @field_validator("custody_proof_mode")
+    @classmethod
+    def _custody_mode(cls, v):
+        v = str(v).strip().lower()
+        if v == "verified":
+            raise ValueError('CUSTODY_PROOF_MODE=verified is not available yet: real zkTLS bank attestations are not connected (use "off" or "simulated")')
+        if v not in ("off", "simulated"):
+            raise ValueError('CUSTODY_PROOF_MODE must be "off" or "simulated"')
+        return v
 
     @field_validator("pyth_mock_price", mode="before")
     @classmethod

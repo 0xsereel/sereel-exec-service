@@ -14,7 +14,7 @@ from ..deps import auth
 from ..errors import ServiceError
 from ..models import DataFeed, NavCheckpoint, now
 from ..strategies import service
-from . import feed, requirements
+from . import custody, feed, requirements
 from .router import endpoint_url
 
 router = APIRouter(prefix="/strategies", dependencies=auth)
@@ -147,6 +147,11 @@ async def publish_nav(sid: str, request: Request):
         s.commit()
         s.refresh(cp)
         cp_id = cp.id
+    with Session(engine) as s:  # the proof is made only now that the checkpoint exists, and is kept OUT of the attested record and memo
+        cp = s.get(NavCheckpoint, cp_id)
+        cp.custody_proof = custody.generate(sid, feed.iso(cp.as_of), feed.iso(cp.created_at))
+        s.add(cp)
+        s.commit()
     record = {"event": "publish_nav", **params, "signed_by": signer, "authorization_nonce": (authorization or {}).get("nonce"), "checkpoint_id": cp_id}
     asig = service._record_action(sid, "publish_nav", record, st.fund_id, signed_by=signer, authorization=authorization)
     with Session(engine) as s:

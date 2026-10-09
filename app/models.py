@@ -242,6 +242,7 @@ class NavCheckpoint(SQLModel, table=True):
     published_by: str = ""
     attestation_sig: str | None = None
     created_at: datetime = Field(default_factory=now)
+    custody_proof: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))  # generated when this checkpoint was stored; never attested
 
 
 class Withdrawal(SQLModel, table=True):
