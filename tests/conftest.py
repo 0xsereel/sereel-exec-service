@@ -35,6 +35,27 @@ _REAL_ENSURE_CURSOR = _watcher.ensure_cursor
 
 
 @pytest.fixture(autouse=True)
+def hermetic_ai_settings(monkeypatch, tmp_path):
+    """The suite must not depend on the developer's .env: the AI and data-feed switches and keys are reset to their shipped defaults, and any test
+    that needs one sets it explicitly."""
+    from app.config import settings
+
+    for name, value in (("agent_enabled", False), ("custody_proof_mode", "off"), ("public_url", ""), ("jev_api_key", ""), ("llm_api_key", ""),
+                        ("signals_source_network", "mainnet")):
+        monkeypatch.setattr(settings, name, value)
+    monkeypatch.setattr(settings, "agent_log_file", str(tmp_path / "logs" / "agent_signals.jsonl"))  # tests never write into the repo's logs/
+    monkeypatch.setattr(settings, "agent_log_state", False)
+
+
+@pytest.fixture(autouse=True)
+def agent_key_in_tmp(tmp_path, monkeypatch):
+    """No test may touch the real keys/ directory: the agent key lives in a per-test temporary path (absent until a test creates it)."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "agent_keypair", str(tmp_path / "agent-key" / "agent.json"))
+
+
+@pytest.fixture(autouse=True)
 def no_devnet_at_startup(monkeypatch):
     """The API's startup takes the deposit watcher's baseline from devnet. Tests must never touch devnet, so it is a no-op unless
     a test uses the fake chain (which supplies a fake RPC and switches the real baseline back on)."""

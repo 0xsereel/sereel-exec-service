@@ -20,6 +20,7 @@ class PythPrice:
     price: Decimal
     publish_time: int
     feed_id: str
+    conf: Decimal = Decimal(0)  # Pyth's 1-sigma confidence interval, in the same units as the price
     market_closed: bool = False  # True: the price is stale because the market is closed (per the feed's schedule)
 
     @property
@@ -103,7 +104,8 @@ def get_price(feed_id: str, max_staleness_s: int | None = 30, symbol: str | None
     if not parsed:
         raise PriceError("UNKNOWN_MARKET", f"no Pyth feed {fid}", 404)
     p = parsed[0]["price"]
-    out = PythPrice(Decimal(p["price"]) * Decimal(10) ** int(p["expo"]), int(p["publish_time"]), fid)
+    out = PythPrice(Decimal(p["price"]) * Decimal(10) ** int(p["expo"]), int(p["publish_time"]), fid,
+                    conf=Decimal(p.get("conf", "0")) * Decimal(10) ** int(p["expo"]))
     if max_staleness_s is not None and out.age_s > max_staleness_s:
         schedule = feed_schedule(fid, symbol) if symbol else None
         if schedule and not is_open(schedule, datetime.now(timezone.utc)):

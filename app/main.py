@@ -43,6 +43,15 @@ async def lifespan(app: FastAPI):
         watcher.ensure_cursor()  # baseline BEFORE any intent can exist, so no deposit can fall into the gap
     except Exception as e:  # RPC hiccup: the first watcher tick retries it
         log.warning("deposit watcher baseline deferred: %s", e)
+    try:
+        from . import solana_client as _sol
+
+        bal = _sol.sol_balance(_sol.funding_kp().pubkey())
+        log.info("funding wallet holds %.4f devnet SOL (it pays token-account rent for the data feed and the refund fees)", bal)
+        if bal < 0.05:
+            log.warning("the funding wallet is low on devnet SOL (%.4f): refunds and data-feed token accounts may fail", bal)
+    except Exception as e:
+        log.warning("could not read the funding wallet's SOL balance: %s", type(e).__name__)
     sched = scheduler.start()
     watcher.register(sched)
     try:
@@ -56,14 +65,14 @@ app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in settings.co
                    allow_methods=["*"], allow_headers=["*"])
 
 
-def err(status: int, code: str, message: str) -> JSONResponse:
+def err(status: int, code: str, message: str, headers: dict | None = None) -> JSONResponse:
     """Cantina v4 error body, exactly: {"error": <human message>, "code": <CODE>} (codes: app.errors.CODES)."""
-    return JSONResponse(status_code=status, content={"error": message, "code": code})
+    return JSONResponse(status_code=status, content={"error": message, "code": code}, headers=headers)
 
 
 @app.exception_handler(ServiceError)
 async def _service_error(_: Request, exc: ServiceError):
-    return err(exc.status, exc.code, exc.message)
+    return err(exc.status, exc.code, exc.message, exc.headers)
 
 
 @app.exception_handler(RequestValidationError)
@@ -86,9 +95,17 @@ async def _unexpected(_: Request, exc: Exception):
 
 from .payments.router import router as payments_router  # noqa: E402
 from .strategies.router import router as strategies_router  # noqa: E402
+from .ai.router import router as agent_router  # noqa: E402
+from .ai.router import strategy_router as agent_strategy_router  # noqa: E402
+from .x402.cantina import router as data_feed_router  # noqa: E402
+from .x402.router import public_router as x402_router  # noqa: E402
 
 app.include_router(payments_router)
 app.include_router(strategies_router)
+app.include_router(agent_router)
+app.include_router(agent_strategy_router)
+app.include_router(data_feed_router)
+app.include_router(x402_router)
 
 
 @app.get("/health")
@@ -100,6 +117,12 @@ def health():
            "hyperliquid": {"network": "testnet" if settings.is_hl_testnet else "mainnet"},
            "solana": {"network": "devnet" if sol.is_devnet() else "other"},
            "stablecoin_mint": settings.stablecoin_mint or None}
+    from .ai import agent_key
+
+    try:
+        out["agent_pubkey"] = agent_key.pubkey()  # what an owner grants a delegation to; null until the key exists
+    except Exception:
+        out["agent_pubkey"] = None
     try:
         out["funding_address"] = str(sol.funding_kp().pubkey())
     except FileNotFoundError:

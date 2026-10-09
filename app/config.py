@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     funding_keypair: str = "./keys/funding.json"
     attest_keypair: str = "./keys/attest.json"
     payment_source_keypair: str = "./keys/payment_source.json"
+    agent_keypair: str = "./keys/agent.json"  # signs the agent's rebalances as a delegate; holds no funds and needs no SOL
 
     hl_connect_timeout_s: float = 60  # while connecting only: the one-off metadata downloads are large and Hyperliquid can be slow
     hl_connect_attempts: int = 4  # a failed connect step is retried (with a growing pause) before giving up
@@ -45,6 +46,43 @@ class Settings(BaseSettings):
     intent_ttl_seconds: int = 3600
     intent_ttl_multisig_seconds: int = 7 * 24 * 3600
 
+    # --- AI agent (all optional; the service runs without any of it) ---
+    agent_enabled: bool = False
+    agent_interval_s: int = 60
+    agent_act_threshold: Decimal = Decimal("0.80")
+    agent_suggest_threshold: Decimal = Decimal("0.50")
+    agent_log_file: str = "./logs/agent_signals.jsonl"  # one JSON line per strategy per cycle: the Jev answers and the decision ("" turns it off)
+    agent_log_state: bool = False  # also write the full state text Jev was shown (about 5 KB a line)
+    agent_run_once_cooldown_s: int = 30  # a second run_once on the same strategy inside this returns the latest decision
+    agent_exec_cap_s: int = 600  # at most one executed agent action per strategy in this window
+    agent_exec_max_divergence_bps: Decimal = Decimal(50)  # execute is downgraded to propose when the execution venue is further from Pyth
+    # --- x402 paid data feed (devnet; settles straight to the customer's wallet through a public facilitator) ---
+    x402_facilitator_url: str = "https://x402.org/facilitator"
+    x402_network: str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"  # Solana devnet, CAIP-2
+    x402_usdc_mint: str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"  # Circle's devnet USDC: x402 only, NOT the service's own mock mint
+    x402_attestation_delay_s: int = 3600  # attestations of executed actions are sold only this long after they happen
+    x402_rate_per_min: int = 30  # per payer and per IP on the public route
+    custody_proof_mode: str = "off"  # off | simulated. A real "verified" mode (zkTLS bank attestations) plugs into app/x402/custody.py later
+    x402_timeout_s: float = 10
+    x402_max_timeout_s: int = 60  # how long a signed payment stays valid (maxTimeoutSeconds)
+    public_url: str = ""  # the externally reachable base URL (e.g. the ngrok domain); empty = taken from the request
+    chat_session_ttl_h: int = 24
+    chat_max_messages: int = 30  # user messages per session
+    chat_max_chars: int = 4000  # per message
+    chat_rate_per_min: int = 12  # per owner
+    signals_source_network: str = "mainnet"  # read-only market signals; execution stays on HL_API_URL (testnet)
+    signals_hl_url: str = "https://api.hyperliquid.xyz"  # info reads ONLY: never an Exchange, never a key
+    jev_base_url: str = "https://gateway.ngrok.ai/v1"
+    jev_api_key: str = ""
+    jev_model: str = "jev-latest"
+    jev_auth_header: str = "auto"  # auto | bearer | x-api-key: auto tries Authorization: Bearer first, then x-api-key on a 401
+    jev_timeout_s: float = 10
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_api_key: str = ""
+    llm_model: str = "deepseek-chat"
+    llm_max_tokens: int = 800
+    llm_timeout_s: float = 20
+
     allow_mainnet: bool = False
     dev_auth_bypass: bool = False  # DEV ONLY: skip signed-message authorization. Refused when ALLOW_MAINNET=true.
     auth_max_age_s: int = 60  # a signed message older than this is rejected
@@ -56,10 +94,26 @@ class Settings(BaseSettings):
     cors_origins: str = ""
     database_url: str = "sqlite:///./service.db"
 
+    @field_validator("custody_proof_mode")
+    @classmethod
+    def _custody_mode(cls, v):
+        v = str(v).strip().lower()
+        if v == "verified":
+            raise ValueError('CUSTODY_PROOF_MODE=verified is not available yet: real zkTLS bank attestations are not connected (use "off" or "simulated")')
+        if v not in ("off", "simulated"):
+            raise ValueError('CUSTODY_PROOF_MODE must be "off" or "simulated"')
+        return v
+
     @field_validator("pyth_mock_price", mode="before")
     @classmethod
     def _blank_is_none(cls, v):
         return None if isinstance(v, str) and not v.strip() else v
+
+    @property
+    def signals_url(self) -> str:
+        """Where market signals are read: mainnet info by default (testnet gold has thin books and 0% funding), or the
+        execution testnet when SIGNALS_SOURCE_NETWORK=testnet."""
+        return self.hl_api_url if self.signals_source_network == "testnet" else self.signals_hl_url
 
     @property
     def is_hl_testnet(self) -> bool:
@@ -101,6 +155,7 @@ class Market(BaseModel):
     pyth_feed_id: str
     max_leverage: int = 3
     max_staleness_s: int = 30
+    unit: str = "units"  # what one unit of the asset is called in messages shown to people (gold: "oz")
     enabled: bool = True  # false lists the market as "coming_soon" and refuses new strategies on it
 
     @property

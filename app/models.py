@@ -146,6 +146,105 @@ class PnlSnapshot(SQLModel, table=True):
     cause: str = "tick"  # tick | action name
 
 
+class PriceSample(SQLModel, table=True):
+    """One price reading per source per minute; the volatility fallback when candle reads fail."""
+    id: int | None = Field(default=None, primary_key=True)
+    market_id: str = Field(index=True)
+    source: str = Field(index=True)  # pyth | hl_signals
+    price: Decimal = money()
+    ts: datetime = Field(default_factory=now, index=True)
+
+
+class ChatSession(SQLModel, table=True):
+    """A setup-assistant conversation. Holds the validated slots, the user/assistant text and the owner-supplied context; no
+    secrets and nothing about other owners."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    owner_pubkey: str = Field(index=True)
+    strategy_id: str | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=now)
+    updated_at: datetime = Field(default_factory=now)
+    expires_at: datetime = Field(index=True)
+    user_messages: int = 0
+    messages: list = Field(default_factory=list, sa_column=Column(JSON, nullable=False))  # [{role, content}], user/assistant only
+    slots: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    context: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    recommendation: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    status: str = "collecting"  # collecting | ready | unsupported
+
+
+class AgentDecision(SQLModel, table=True):
+    """One cycle's outcome for one strategy. `none` rows are a heartbeat: the newest one is updated in place, not appended."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    at: datetime = Field(default_factory=now, index=True)
+    state_hash: str
+    signals_source: str  # jev | rules
+    signals_network: str
+    question_set_version: str
+    signals: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))  # name -> probability string
+    decision: str  # none | hold | suggest | propose | execute
+    action: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))  # {type, params}
+    explanation: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))  # {headline, explanation, risk_note}
+    reason: str = ""  # the rule that fired, one deterministic line
+    downgraded_from: str | None = None
+    outcome: str = Field(default="pending", index=True)  # pending | executed | rejected | dismissed | failed
+    action_id: str | None = None  # the Action row that resolved it
+    attestation_sig: str | None = None
+
+
+class Delegate(SQLModel, table=True):
+    """An owner-signed grant letting `delegate_pubkey` sign `rebalance` (and nothing else) on one strategy, within limits. The limits
+    are kept exactly as signed (strings) so the API can echo them back unchanged. Rows are history: a revoked or replaced grant stays."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    delegate_pubkey: str = Field(index=True)
+    allowed_actions: str = "rebalance"
+    max_rebalance_oz_per_day: str  # as signed, e.g. "0.5"
+    rebalance_within_band_only: str  # as signed: "true" | "false"
+    expires_at: datetime
+    granted_at: datetime = Field(default_factory=now)
+    granted_by: str = ""  # the owner's signing key
+    revoked_at: datetime | None = None
+    attestation_sig: str | None = None
+    revoke_attestation_sig: str | None = None
+
+
+class DataFeed(SQLModel, table=True):
+    """Per-strategy x402 data feed configuration. Absent or `enabled=false` means nothing about the strategy is ever served."""
+    strategy_id: str = Field(primary_key=True)
+    enabled: bool = False
+    price_usd: str | None = None  # as signed, e.g. "0.01"
+    pay_to: str | None = None  # the customer's wallet: payments settle straight to it
+    fields: str = ""  # comma-separated subset of the sellable fields
+    fund_address: str | None = None  # a Solana fund this strategy hedges (NAV source, once that reader exists)
+    updated_at: datetime = Field(default_factory=now)
+
+
+class DataPayment(SQLModel, table=True):
+    """One settled x402 payment. tx_signature is UNIQUE, so a replayed payment is recorded (and served) once."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    payer: str
+    amount_usd: Decimal = money()
+    mint: str
+    tx_signature: str = Field(unique=True)
+    settled_at: datetime = Field(default_factory=now, index=True)
+    fields_served: str = ""
+
+
+class NavCheckpoint(SQLModel, table=True):
+    """A NAV the owner published (signed, attested). The feed's NAV figures come from here and nowhere else."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    nav_per_share: str  # as signed
+    unhedged_nav_per_share: str
+    as_of: datetime = Field(index=True)
+    published_by: str = ""
+    attestation_sig: str | None = None
+    created_at: datetime = Field(default_factory=now)
+    custody_proof: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))  # generated when this checkpoint was stored; never attested
+
+
 class Withdrawal(SQLModel, table=True):
     """Return-excess and close share this state machine."""
     id: str = Field(default_factory=new_id, primary_key=True)

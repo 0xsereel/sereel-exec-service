@@ -50,7 +50,9 @@ def check_conventions(obj):
         if key in TIMESTAMP_KEYS and value is not None:
             assert isinstance(value, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT[\d:.]+Z", value), (path, value)
             datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if key.endswith("_usd") and value is not None:
+        if key == "data_income_usd":  # the agent contract pins this one as a decimal string; every v4 money field stays a number
+            assert isinstance(value, str) and re.fullmatch(r"\d+\.\d\d+", value), (path, value)
+        elif key.endswith("_usd") and value is not None:
             assert isinstance(value, (int, float)) and not isinstance(value, bool), (path, value)  # a number, not "12.5"
         if key.endswith("_bps") and value is not None:
             assert isinstance(value, int) and not isinstance(value, bool), (path, value)

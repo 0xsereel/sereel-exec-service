@@ -37,6 +37,18 @@ CODES: dict[str, tuple[int, str]] = {
     "WITHDRAW_FAILED": (400, "the bridge rejected the withdrawal"),
     # --- payments ---
     "PAYMENT_FAILED": (502, "the Solana payout failed"),
+    # --- AI agent ---
+    "SIGNALS_UNAVAILABLE": (503, "the agent could not read enough market data (neither Pyth nor Hyperliquid) to take a decision this cycle"),
+    "DELEGATE_LIMIT_EXCEEDED": (403, "a delegate's rebalance would exceed the limits the owner signed (daily size, or a forced rebalance on a band-only grant)"),
+    "DELEGATE_NOT_ALLOWED": (403, "the signer is a delegate but this action is not allowed for delegates (only rebalance is), or its grant has expired or been revoked"),
+    "DATA_FEED_DISABLED": (404, "no data feed is available for that id (disabled or unknown: the answer is identical, so nothing about a strategy leaks)"),
+    "PAYMENT_INVALID": (402, "the x402 payment was not accepted (missing, malformed, underpaid, replayed or rejected by the facilitator)"),
+    "FACILITATOR_UNAVAILABLE": (503, "the x402 facilitator could not be reached, so a payment could be neither verified nor settled; nothing was charged by the service"),
+    "RATE_LIMITED": (429, "too many requests to the public data-feed route from this payer or address"),
+    "AGENT_DISABLED": (503, "the AI agent is switched off (AGENT_ENABLED=false)"),
+    "LLM_UNAVAILABLE": (503, "the language model could not be reached or is not configured; the chat cannot respond (use the manual form)"),
+    "CHAT_SESSION_EXPIRED": (410, "the chat session is older than 24 hours; start a new one"),
+    "CHAT_LIMIT_REACHED": (429, "too many chat messages: the session reached its message cap or the owner is sending too fast"),
     # --- market maker (CLI only; never returned by the API) ---
     "MM_MAINNET_REFUSED": (0, "the market maker refuses to run unless HL_API_URL is testnet"),
     "MM_SIZE_OUT_OF_RANGE": (0, "market maker order size outside MM_MIN_SIZE..MM_MAX_SIZE"),
@@ -47,8 +59,10 @@ CODES: dict[str, tuple[int, str]] = {
 class ServiceError(Exception):
     status = 400
 
-    def __init__(self, code: str, message: str, status: int | None = None):
+    headers: dict | None = None  # extra response headers (e.g. PAYMENT-REQUIRED on a 402)
+
+    def __init__(self, code: str, message: str, status: int | None = None, headers: dict | None = None):
         super().__init__(message)
-        self.code, self.message = code, message
+        self.code, self.message, self.headers = code, message, headers
         if status:
             self.status = status

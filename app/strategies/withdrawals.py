@@ -369,6 +369,10 @@ def _complete(wid: str, sig: str | None) -> None:
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
+    if w.type == "return_excess":
+        from ..ai import decisions
+
+        decisions.resolve_executed(w.strategy_id, "return_excess")  # the owner returned excess margin: the proposal is answered
     svc.take_snapshot(w.strategy_id, "close" if w.type == "close" else "return_excess")
 
 

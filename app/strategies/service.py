@@ -24,6 +24,8 @@ from ..state import state
 from ..util import iso, num
 from ..venue.base import DEFAULT_SLIPPAGE, account_lock
 from . import attest as att
+from .. import delegates
+from ..ai import decisions
 
 log = logging.getLogger("sereel.strategies")
 LIVE = (S_ACTIVE, S_REBALANCING, S_CLOSING)  # statuses in which the strategy holds margin and a position
@@ -119,6 +121,34 @@ def _owned(st: Strategy | None, org: str) -> Strategy:
 
 # ---- create / cancel / top-up ----------------------------------------------
 
+def quote_strategy(m, exposure: Decimal, hedge_ratio_bps: int, leverage: int,
+                   expected_amount_usd: Decimal | None = None) -> tuple[Decimal, Decimal, Decimal]:
+    """(hedge size, mark, required margin) for a strategy, applying the venue's minimum order and, when an amount is given, the
+    margin floor. One function for create and for the setup assistant's draft, so a draft can never be a strategy that create
+    would refuse."""
+    size = exposure * Decimal(hedge_ratio_bps) / 10_000
+    mark = venue().mark_price(m.market_id)
+    notional, minimum = size * mark, settings.min_order_usd * Decimal("1.05")  # 5% cushion for the mark moving before the order
+    if 0 < size and notional < minimum:
+        need = (minimum / mark / (Decimal(hedge_ratio_bps) / 10_000)).quantize(Decimal("0.0001"), rounding="ROUND_UP")
+        unit = m.unit
+        raise _bad(f"the hedge would be {size} {unit} (about ${notional:.2f}), below the venue's ${settings.min_order_usd} minimum order. "
+                   f"Raise target_exposure_units to at least {need.normalize():f} {unit} at hedge_ratio_bps {hedge_ratio_bps} "
+                   f"(about ${required_margin(need * Decimal(hedge_ratio_bps) / 10_000, mark, leverage):.2f} of margin)")
+    required = required_margin(size, mark, leverage)
+    floor = required * (1 - settings.rebalance_tolerance_pct / 100)
+    if expected_amount_usd is not None and expected_amount_usd < floor:
+        raise _bad(f"expected_amount_usd {expected_amount_usd} is below the required margin {required} "
+                   f"(a {size} short at {leverage}x plus {settings.margin_buffer_pct}% buffer)")
+    return size, mark, required
+
+
+def short_liquidation_price(cash: Decimal, entry: Decimal, size: Decimal, rate: Decimal) -> Decimal:
+    """Price at which a short of `size` opened at `entry`, backed by `cash`, reaches maintenance (the position_out formula)."""
+    return (cash + entry * size) / (size * (1 + rate))
+
+
+
 def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> Strategy:
     m = market(body.market_id)
     if body.target_exposure_units <= 0:
@@ -138,19 +168,7 @@ def create_strategy(body: CreateStrategyIn, user: str = "", org: str = "") -> St
     owner_pubkey, owner_multisig = validate_owner(body.owner_pubkey, body.owner_multisig,
                                                   required=not settings.auth_bypass_active)
 
-    size = body.target_exposure_units * Decimal(body.hedge_ratio_bps) / 10_000
-    mark = venue().mark_price(body.market_id)
-    notional, minimum = size * mark, settings.min_order_usd * Decimal("1.05")  # 5% cushion for the mark moving before the order
-    if 0 < size and notional < minimum:
-        need = (minimum / mark / (Decimal(body.hedge_ratio_bps) / 10_000)).quantize(Decimal("0.0001"), rounding="ROUND_UP")
-        raise _bad(f"the hedge would be {size} units (about ${notional:.2f}), below the venue's ${settings.min_order_usd} minimum order. "
-                   f"Raise target_exposure_units to at least {need} at hedge_ratio_bps {body.hedge_ratio_bps} "
-                   f"(about ${required_margin(need * Decimal(body.hedge_ratio_bps) / 10_000, mark, body.leverage):.2f} of margin)")
-    required = required_margin(size, mark, body.leverage)
-    floor = required * (1 - settings.rebalance_tolerance_pct / 100)
-    if body.expected_amount_usd < floor:
-        raise _bad(f"expected_amount_usd {body.expected_amount_usd} is below the required margin {required} "
-                   f"(a {size} short at {body.leverage}x plus {settings.margin_buffer_pct}% buffer)")
+    size, mark, required = quote_strategy(m, body.target_exposure_units, body.hedge_ratio_bps, body.leverage, body.expected_amount_usd)
     multisig = sol.is_multisig_address(body.registered_sender_address)  # a Squads vault is an off-curve PDA
     with Session(engine) as s:
         st = Strategy(fund_id=body.fund_id, fund_name=body.fund_name or body.fund_id, market_id=m.market_id,
@@ -429,9 +447,9 @@ def reconcile() -> dict:
 
 def _record_action(strategy_id: str, action: str, record: dict, fund_id: str, solana_signature: str | None = None,
                    hl_order_ids: list | None = None, signed_by: str | None = None, authorization: dict | None = None,
-                   attest: bool = True) -> str | None:
+                   attest: bool = True, memo_extra: dict | None = None) -> str | None:
     """Store the full record and (unless attest=False) attest its hash on Solana. Returns the attestation signature."""
-    sig = att.attest(strategy_id, fund_id, action, record) if attest else None
+    sig = att.attest(strategy_id, fund_id, action, record, memo_extra) if attest else None
     with Session(engine) as s:
         s.add(Action(strategy_id=strategy_id, action=action, record=att.jsonable(record), solana_signature=solana_signature,
                      hl_order_ids=hl_order_ids or [], attestation_sig=sig, signer_public_key=signed_by,
@@ -606,6 +624,7 @@ def confirm_deposit(did: str) -> None:
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
+    decisions.resolve_executed(sid, "top_up")  # the top-up funding intent completed: a pending top-up proposal is answered
     take_snapshot(sid, "deposit")
 
 
@@ -768,14 +787,49 @@ def _parse_edit(params: dict) -> tuple[int | None, Decimal | None]:
     return ratio, exposure
 
 
-def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strategy:
-    """PATCH: change the hedge ratio and/or exposure. Moves the TARGET only; no order is sent (that is rebalance)."""
-    ratio, exposure = _parse_edit(params)
+def require_order_viable(st: Strategy, target_signed: Decimal, mark: Decimal, what: str, check_margin: bool = True) -> None:
+    """Before a signature is spent: would moving this strategy to `target_signed` be an order the venue accepts? It refuses
+    a trade worth less than the venue's minimum order (a full close to zero is exempt: it only reduces) and, when it grows
+    the short, one the strategy's own cash cannot margin. Nothing is sent and no nonce is burned."""
+    delta = target_signed - st.size
+    unit = state.markets[st.market_id].unit if st.market_id in state.markets else "units"
+    if delta == 0 or target_signed == 0:
+        return
+    notional, minimum = abs(delta) * mark, settings.min_order_usd * Decimal("1.05")  # cushion: the mark moves before the order
+    if notional < minimum:
+        need = (minimum / mark).quantize(Decimal("0.0001"), rounding="ROUND_UP")
+        raise _bad(f"{what} would trade {abs(delta).normalize():f} {unit} (about ${notional:.2f}), below the venue's "
+                   f"${settings.min_order_usd} minimum order. Nothing was sent. A change of at least {need.normalize():f} {unit} is needed; "
+                   f"make a larger change or leave the target where it is")
+    if check_margin and abs(target_signed) > abs(st.size):
+        cash = st.margin_usd + st.realized_pnl_usd + st.funding_usd - st.fees_usd
+        needed = abs(target_signed) * mark / st.leverage
+        if needed > cash:
+            raise ServiceError("INSUFFICIENT_MARGIN", f"a {abs(target_signed)} short at {st.leverage}x needs {needed:.2f} USD "
+                               f"but the strategy holds {cash:.2f}; add margin with a top-up first. Nothing was sent")
+
+
+def exposure_plan(st: Strategy, new_exposure: Decimal, ratio_bps: int | None = None) -> dict:
+    """What moving the fund exposure to `new_exposure` (and, optionally, the ratio) means for this strategy, and whether the rebalance it would
+    cause is one the venue accepts. Raises BAD_REQUEST (the same message PATCH gives) if it is not. Nothing is stored or sent."""
+    mark = venue().mark_price(st.market_id)
+    new_target = new_exposure * Decimal(ratio_bps if ratio_bps is not None else st.hedge_ratio_bps) / 10_000
+    held = abs(st.size)
+    gap_bps = int(abs(new_target - held) / new_target * 10_000) if new_target else 0
+    if gap_bps > st.rebalance_band_bps:  # a rebalance would have to trade: make sure it could
+        require_order_viable(st, -new_target, mark, "moving to this target", check_margin=False)  # margin: the owner tops up after the edit
+    gap_pct = (abs(new_target - held) / new_target * 100) if new_target else Decimal(0)
+    return {"mark": mark, "new_target_size": new_target, "held": held, "gap_bps": gap_bps, "gap_pct": gap_pct,
+            "outside_band": gap_bps > st.rebalance_band_bps}
+
+
+def _edit(sid: str, ratio: int | None, exposure: Decimal | None, params: dict, authorization, org: str, action: str) -> Strategy:
+    """The shared body of PATCH (edit_hedge_settings) and POST /exposure (update_exposure): moves the TARGET only; no order is sent."""
     st = get_strategy(sid, org)
     if st.status != S_ACTIVE:
         raise ServiceError("CONFLICT", f"strategy is {st.status}; settings can only be edited while it is active", 409)
-    st, signer = authorize_action(sid, "edit_hedge_settings", authorization, params, org)
-    mark = venue().mark_price(st.market_id)
+    mark = exposure_plan(st, exposure if exposure is not None else st.target_exposure_units, ratio)["mark"]
+    st, signer = authorize_action(sid, action, authorization, params, org)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         before = {"hedge_ratio_bps": st.hedge_ratio_bps, "target_exposure_units": st.target_exposure_units,
@@ -791,16 +845,34 @@ def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strat
         after = {"hedge_ratio_bps": st.hedge_ratio_bps, "target_exposure_units": st.target_exposure_units,
                  "required_margin_usd": st.required_margin_usd}
         fund, size, target = st.fund_id, st.size, target_size(st)
-    record = {"event": "edit_hedge_settings", "from": before, "to": after, "target_size": target, "current_size": size,
+    record = {"event": action, "from": before, "to": after, "target_size": target, "current_size": size,
               "signed_by": signer, "authorization_nonce": (authorization or {}).get("nonce")}
-    asig = _record_action(sid, "edit_hedge_settings", record, fund, signed_by=signer, authorization=authorization)
+    asig = _record_action(sid, action, record, fund, signed_by=signer, authorization=authorization)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
-    take_snapshot(sid, "edit_hedge_settings")
+    take_snapshot(sid, action)
     return get_strategy(sid, org)
+
+
+def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strategy:
+    """PATCH: change the hedge ratio and/or exposure. Moves the TARGET only; no order is sent (that is rebalance)."""
+    ratio, exposure = _parse_edit(params)
+    return _edit(sid, ratio, exposure, params, authorization, org, "edit_hedge_settings")
+
+
+def update_exposure(sid: str, params: dict, authorization, org: str = "") -> Strategy:
+    """POST /strategies/{id}/exposure: the owner signs `update_exposure {exposure_oz}`, the new TOTAL fund exposure in oz. Moves the target only; no
+    trade (the agent rebalances on its next check, or proposes it). The same checks as an edit: a target the venue could not trade is refused."""
+    try:
+        exposure = Decimal(params["exposure_oz"])
+    except (KeyError, ArithmeticError):
+        raise _bad("exposure_oz is required: the new total fund exposure in oz, as a decimal string")
+    if exposure <= 0:
+        raise _bad("exposure_oz must be positive")
+    return _edit(sid, None, exposure, params, authorization, org, "update_exposure")
 
 
 def hedge_gap(st: Strategy) -> tuple[Decimal, int]:
@@ -812,7 +884,7 @@ def hedge_gap(st: Strategy) -> tuple[Decimal, int]:
     return gap, int(abs(gap) / target * 10_000)
 
 
-def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> Strategy:
+def rebalance(sid: str, authorization, force: bool = False, org: str = "", agent_meta: dict | None = None) -> Strategy:
     """Move the hedge to its target if the gap is beyond the strategy's rebalance band (or `force`). Shrinking is
     reduce-only; growing needs the strategy's own capital to cover the new size at its leverage."""
     st = get_strategy(sid, org)
@@ -823,8 +895,10 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
     gap0, gap_bps0 = hedge_gap(st)
     if abs(gap0) >= quantum0 and (force or gap_bps0 > st.rebalance_band_bps):  # a trade would happen: is there a book to take it?
         delta0 = -target_size(st) - st.size  # signed size the rebalance would trade: > 0 buys (shrinking a short), < 0 sells
+        require_order_viable(st, -target_size(st), v0.mark_price(st.market_id), "this rebalance")
         require_liquidity(st.market_id, delta0 > 0, abs(delta0), "this rebalance")
     st, signer = authorize_action(sid, "rebalance", authorization, {}, org)
+    grant = delegates.grant_for_signer(sid, signer)  # None for the owner; a delegate acts within its signed limits
     v = venue()
     nonce = (authorization or {}).get("nonce")
     with account_lock(v.account_key):
@@ -853,6 +927,8 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
                 if ledger_drift(s, st.market_id):
                     raise ServiceError("CONFLICT", "the venue position differs from the ledger; rebalancing is held until it is reconciled", 409)
                 require_liquidity(st.market_id, (target_signed - st.size) > 0, abs(target_signed - st.size), "this rebalance")  # again, now
+                if grant is not None:  # a delegate's limits are enforced here, on every request, from what the owner signed
+                    delegates.check_rebalance(grant, sid, force, abs(target_signed - st.size))
                 st.status = S_REBALANCING
                 s.add(st)
                 s.commit()
@@ -883,13 +959,25 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
                       "realized_pnl_usd": realized, "size_after": st.size, "entry_px_after": st.entry_px, "hl_oids": fill.oids,
                       "reduce_only": [p.reduce_only for p in fill.partials], "signed_by": signer, "authorization_nonce": nonce,
                       "market_closed": v.market_closed.get(market_id, False)}
+            if grant is not None:
+                record["signed_by_role"] = "delegate"
+                record["delegate_grant"] = {"max_rebalance_oz_per_day": grant.max_rebalance_oz_per_day, "expires_at": delegates.iso(grant.expires_at),
+                                            "rebalance_within_band_only": grant.rebalance_within_band_only}
+            if agent_meta:
+                record["agent"] = agent_meta  # the state hash, every probability, the model ids and the decision id: the memo's hash commits to them
             oids = list(fill.oids)
-    asig = _record_action(sid, "rebalance", record, fund, hl_order_ids=oids, signed_by=signer, authorization=authorization)
+    memo_extra = None
+    if grant is not None:
+        memo_extra = {"by": "delegate"}
+        if agent_meta:  # compact: the state hash, the probabilities that triggered the action, the question set and the Jev model
+            memo_extra.update({"sh": agent_meta["state_hash"], "p": agent_meta["trigger"], "q": agent_meta["question_set_version"], "m": agent_meta["model"]})
+    asig = _record_action(sid, "rebalance", record, fund, hl_order_ids=oids, signed_by=signer, authorization=authorization, memo_extra=memo_extra)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
+    decisions.resolve_executed(sid, "rebalance")  # a pending proposal of this type is now answered
     take_snapshot(sid, "rebalance")
     return get_strategy(sid, org)
 
@@ -1026,7 +1114,7 @@ def position_out(st: Strategy, mark: Decimal | None) -> dict | None:
     health = max(0, min(10_000, int(10_000 * (equity - maintenance) / equity))) if equity > 0 else 0
     liq = None
     if magnitude:
-        liq = (cash + st.entry_px * magnitude) / (magnitude * (1 + rate)) if size < 0 \
+        liq = short_liquidation_price(cash, st.entry_px, magnitude, rate) if size < 0 \
             else (st.entry_px * magnitude - cash) / (magnitude * (1 - rate))
     venue_liq = venue_liquidation_for(st.market_id) if magnitude else None
     if liq is not None and venue_liq is not None:
@@ -1040,6 +1128,15 @@ def position_out(st: Strategy, mark: Decimal | None) -> dict | None:
             "funding_paid_usd": num(-st.funding_usd), "fees_usd": num(st.fees_usd), "margin_health_bps": health,
             "maintenance_margin_usd": num(maintenance), "liquidation_price_usd": num(liq),
             "hl_order_ids": list(st.hl_order_ids or [])}
+
+
+def data_feed_fields(strategy_id: str) -> dict:
+    """data_feed_enabled (bool) and data_income_usd (decimal string): the opt-in switch and what the feed has earned the customer."""
+    from ..x402 import feed
+
+    cfg = feed.config(strategy_id)
+    total, _, _ = feed.income(strategy_id)
+    return {"data_feed_enabled": bool(cfg and cfg.enabled), "data_income_usd": feed.money_str(total)}
 
 
 def strategy_out(st: Strategy) -> dict:
@@ -1063,6 +1160,8 @@ def strategy_out(st: Strategy) -> dict:
         "deployed_at": iso(st.deployed_at), "closed_at": iso(st.closed_at), "position": position_out(st, mark),
         "market_closed": bool(venue().market_closed.get(st.market_id, False)), "failure_reason": st.failure_reason,
         "hedge_gap_units": num(gap_units), "hedge_gap_bps": gap_bps,  # target short minus current short; > 0 = under-hedged
+        "agent_mode": decisions.agent_mode(st.id), "has_unread_proposal": decisions.has_unread_proposal(st.id),
+        **data_feed_fields(st.id),
     }
 
 

@@ -29,8 +29,10 @@ def record_hash(record: dict) -> str:
     return hashlib.sha256(json.dumps(jsonable(record), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def memo_for(strategy_id: str, fund_id: str, action: str, record: dict) -> str:
-    memo = {"v": 1, "id": strategy_id, "fund": fund_id, "a": action, "net": NETWORK, "h": record_hash(record)}
+def memo_for(strategy_id: str, fund_id: str, action: str, record: dict, extra: dict | None = None) -> str:
+    """`extra` adds short keys to the memo (an agent action: who signed, the state it saw, the probabilities that triggered it); the
+    full detail lives in `record`, which `h` commits to."""
+    memo = {"v": 1, "id": strategy_id, "fund": fund_id, "a": action, "net": NETWORK, "h": record_hash(record), **(extra or {})}
     text = json.dumps(memo, separators=(",", ":"))
     if len(text.encode()) > MAX_MEMO_BYTES:  # an unusually long fund id must not stop the attestation
         memo["fund"] = fund_id[:32]
@@ -38,10 +40,10 @@ def memo_for(strategy_id: str, fund_id: str, action: str, record: dict) -> str:
     return text
 
 
-def attest(strategy_id: str, fund_id: str, action: str, record: dict) -> str | None:
+def attest(strategy_id: str, fund_id: str, action: str, record: dict, extra: dict | None = None) -> str | None:
     """Post the memo from the attest key. Returns the signature, or None if posting failed (trading never waits on it)."""
     try:
-        return sol.post_memo(memo_for(strategy_id, fund_id, action, record))
+        return sol.post_memo(memo_for(strategy_id, fund_id, action, record, extra))
     except Exception as e:
         log.error("attestation of %s %s failed: %s", action, strategy_id, e)
         return None

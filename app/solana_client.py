@@ -81,6 +81,14 @@ def attest_kp() -> Keypair:
     return load_keypair(settings.attest_keypair)
 
 
+def agent_kp() -> Keypair | None:
+    """The agent's delegate signing key, or None if it has not been created (`sereel init` / `sereel agent key`)."""
+    try:
+        return load_keypair(settings.agent_keypair)
+    except FileNotFoundError:
+        return None
+
+
 def mint_authority_kp() -> Keypair:
     return load_keypair(settings.mint_authority_keypair)
 
