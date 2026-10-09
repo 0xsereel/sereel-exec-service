@@ -168,7 +168,7 @@ def test_nothing_describes_a_simulated_proof_as_verified(api, fakechain, fac, si
         proof = body["custody_proof"]
         assert proof["mode"] == "simulated" and proof["note"] == NOTE
         assert "verified" not in json.dumps(proof).lower()
-    readme = (__import__("pathlib").Path(__file__).resolve().parent.parent / "README.md").read_text()
+    readme = (__import__("pathlib").Path(__file__).resolve().parent.parent / "docs" / "REFERENCE.md").read_text()
     section = readme[readme.index("Custody proofs"):]
     para = section[:section.index("\n\n", 100)]
     assert "simulated" in para.lower() and "not" in para.lower() and "never" in para.lower()

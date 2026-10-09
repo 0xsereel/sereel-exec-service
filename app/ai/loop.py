@@ -14,7 +14,7 @@ from ..models import S_ACTIVE, AgentDecision, Strategy, now
 from ..state import state
 from .. import delegates
 from ..strategies import service
-from . import actions, agent_key, decisions
+from . import actions, agent_key, decisions, signal_log
 from .decide import Decision, decide
 from .explain import explain
 from .signals import get_signals
@@ -53,7 +53,7 @@ def run_strategy(sid: str) -> AgentDecision:
                           question_set_version=sig.question_set_version,
                           signals={k: f"{v:.2f}" for k, v in sorted(sig.probabilities.items())},
                           decision=d.kind, action=d.action, explanation=explanation, reason=d.reason, downgraded_from=d.downgraded_from)
-    log.info("agent %s: %s%s (%s, signals %s)", sid[:8], d.kind, f" {d.action['type']}" if d.action else "", d.reason, sig.source)
+    signal_log.record(sid, snap, sig, d)  # every Jev answer and the decision, one line per cycle, plus the rotating JSON file
     if d.kind == "execute":
         row = _execute(sid, row, snap, sig)
     return row
@@ -111,7 +111,9 @@ def run_cycle() -> int:
                 run_strategy(sid)
                 n += 1
             except Exception as e:
-                log.warning("agent cycle for %s failed: %s", sid[:8], getattr(e, "code", type(e).__name__))
+                code = getattr(e, "code", type(e).__name__)
+                log.warning("agent cycle for %s failed: %s", sid[:8], code)
+                signal_log.record_failure(sid, code, str(getattr(e, "message", e))[:200])
         last_cycle["at"] = now()
         return n
     finally:

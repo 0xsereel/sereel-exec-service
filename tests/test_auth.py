@@ -270,10 +270,10 @@ def test_a_number_is_rejected_before_anything_is_stored_or_checked(api):
 
 
 def test_published_test_vectors_match_the_implementation_and_the_readme():
-    """The README tells client authors to check their code against these exact values."""
+    """docs/REFERENCE.md tells client authors to check their code against these exact values."""
     v = json.loads((Path(__file__).parent / "fixtures" / "auth_vectors.json").read_text())
     signer = Signer(bytes.fromhex(v["seed_hex"]))
-    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    readme = (Path(__file__).parent.parent / "docs" / "REFERENCE.md").read_text()
     assert signer.pubkey == v["publicKey"] and v["publicKey"] in readme
     for vec in v["vectors"]:
         assert auth.canonical_json(vec["params"]) == vec["canonical"]

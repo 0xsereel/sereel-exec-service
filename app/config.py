@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     agent_interval_s: int = 60
     agent_act_threshold: Decimal = Decimal("0.80")
     agent_suggest_threshold: Decimal = Decimal("0.50")
+    agent_log_file: str = "./logs/agent_signals.jsonl"  # one JSON line per strategy per cycle: the Jev answers and the decision ("" turns it off)
+    agent_log_state: bool = False  # also write the full state text Jev was shown (about 5 KB a line)
     agent_run_once_cooldown_s: int = 30  # a second run_once on the same strategy inside this returns the latest decision
     agent_exec_cap_s: int = 600  # at most one executed agent action per strategy in this window
     agent_exec_max_divergence_bps: Decimal = Decimal(50)  # execute is downgraded to propose when the execution venue is further from Pyth

@@ -39,7 +39,7 @@ NONCE_TTL_S = 120  # anything older than the 60s age limit is already rejected; 
 
 
 # ---- canonical params ------------------------------------------------------------------------------------------------
-# The exact format clients must produce (see the README): a flat JSON object whose values are ALL strings.
+# The exact format clients must produce (see docs/REFERENCE.md): a flat JSON object whose values are ALL strings.
 #   * UTF-8 JSON, keys sorted (by code point), no whitespace anywhere
 #   * no JSON numbers anywhere: amounts are decimal strings ("520.5") and whole numbers are digit strings ("6000")
 #   * strings are escaped as JSON.stringify does (", \, control characters); non-ASCII is left as is

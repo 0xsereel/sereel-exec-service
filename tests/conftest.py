@@ -35,7 +35,7 @@ _REAL_ENSURE_CURSOR = _watcher.ensure_cursor
 
 
 @pytest.fixture(autouse=True)
-def hermetic_ai_settings(monkeypatch):
+def hermetic_ai_settings(monkeypatch, tmp_path):
     """The suite must not depend on the developer's .env: the AI and data-feed switches and keys are reset to their shipped defaults, and any test
     that needs one sets it explicitly."""
     from app.config import settings
@@ -43,6 +43,8 @@ def hermetic_ai_settings(monkeypatch):
     for name, value in (("agent_enabled", False), ("custody_proof_mode", "off"), ("public_url", ""), ("jev_api_key", ""), ("llm_api_key", ""),
                         ("signals_source_network", "mainnet")):
         monkeypatch.setattr(settings, name, value)
+    monkeypatch.setattr(settings, "agent_log_file", str(tmp_path / "logs" / "agent_signals.jsonl"))  # tests never write into the repo's logs/
+    monkeypatch.setattr(settings, "agent_log_state", False)
 
 
 @pytest.fixture(autouse=True)

@@ -190,3 +190,51 @@ def key():
     console.print(f"agent public key: [bold]{kp.pubkey()}[/]")
     console.print("It signs rebalances only for strategies whose owner granted it a delegation. It holds no funds and needs no SOL.")
     console.print("[yellow]Back up keys/ with the others.[/]")
+
+
+@agent_app.command("log")
+def show_log(n: int = typer.Option(20, "-n", help="How many of the latest entries"),
+             strategy: str = typer.Option(None, "--strategy", help="Only this strategy (id or its first characters)"),
+             raw: bool = typer.Option(False, "--raw", help="Print the JSON lines as written"),
+             follow: bool = typer.Option(False, "--follow", "-f", help="Keep printing new entries as they arrive")):
+    """What Jev (or the rules) answered on every agent cycle, and what was decided. Reads AGENT_LOG_FILE."""
+    from app.ai import signal_log
+
+    path = signal_log._path()
+    if path is None:
+        _fail("AGENT_LOG_FILE is empty: the agent log is off")
+
+    from rich.markup import escape
+
+    def show(e: dict):
+        if raw:
+            typer.echo(json.dumps(e))  # plain echo: no wrapping, so each line stays one valid JSON document
+        elif "error" in e:
+            console.print(f"{e['at']}  {e['strategy_id'][:8]}  [red]ERROR {escape(e['error'])}[/] {escape(e.get('message', ''))}", soft_wrap=True)
+        else:
+            jev = e.get("jev") or {}
+            src = f"jev {jev.get('latency_ms')}ms" if e["source"] == "jev" else f"rules ({e.get('jev_error', 'no jev')})"
+            act = " " + e["action"]["type"] if e.get("action") else ""
+            console.print(f"{e['at']}  {e['strategy_id'][:8]}  [bold]{escape(e['decision'] + act)}[/]  \\[{escape(src)}]  {escape(e['reason'])}", soft_wrap=True)
+            console.print("    " + escape("  ".join(f"{k}={v}" for k, v in e["probabilities"].items())), soft_wrap=True)
+
+    entries = signal_log.tail(n, strategy)
+    if not entries and not follow:
+        console.print(f"no entries yet in {path} (the agent logs one line per strategy per cycle; AGENT_ENABLED must be true)")
+    for e in entries:
+        show(e)
+    if follow:
+        import time
+
+        seen = len(path.read_text().splitlines()) if path.exists() else 0
+        while True:
+            time.sleep(2)
+            lines = path.read_text().splitlines() if path.exists() else []
+            for line in lines[seen:]:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if strategy is None or e.get("strategy_id", "").startswith(strategy):
+                    show(e)
+            seen = len(lines)

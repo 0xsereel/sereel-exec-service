@@ -1,4 +1,4 @@
-"""The error-code registry, the source, and the README must agree (Cantina matches some codes by exact spelling)."""
+"""The error-code registry, the source, and docs/REFERENCE.md must agree (Cantina matches some codes by exact spelling)."""
 import re
 from pathlib import Path
 
@@ -19,13 +19,13 @@ def codes_in_source() -> set[str]:
 
 def test_every_code_used_in_the_source_is_registered():
     unregistered = codes_in_source() - set(CODES)
-    assert not unregistered, f"add to app/errors.py CODES and the README: {sorted(unregistered)}"
+    assert not unregistered, f"add to app/errors.py CODES and docs/REFERENCE.md: {sorted(unregistered)}"
 
 
 def test_every_registered_code_is_in_the_readme():
-    readme = (ROOT / "README.md").read_text()
+    readme = (ROOT / "docs" / "REFERENCE.md").read_text()
     missing = [c for c in CODES if f"`{c}`" not in readme]
-    assert not missing, f"README 'Error codes' table is missing: {missing}"
+    assert not missing, f"docs/REFERENCE.md 'Error codes' table is missing: {missing}"
 
 
 def test_cantina_special_codes_are_spelled_exactly_and_registered():
