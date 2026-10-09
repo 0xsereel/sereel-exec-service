@@ -84,18 +84,24 @@ CALM = [("volatility", "realized_vol_24h_annualized", "15.00%"), ("volatility", 
         ("venue", "mark_vs_pyth_bps", "0.2"), ("venue", "funding_rate_annualized", "8.00%"),
         ("calendar", "events_within_24h", "none"),
         ("sizing", "depth_to_size_ratio", "20.00"), ("sizing", "testnet_depth_same_side_within_0.5pct_oz", "1.0000"),
-        ("strategy", "maintenance_ratio", "4.50"), ("strategy", "equity_to_required_ratio", "2.60"), ("strategy", "gap_pct", "3.00"),
+        ("strategy", "maintenance_ratio", "4.50"), ("strategy", "stress_ratio_3sigma_1h", "4.20"), ("strategy", "equity_to_required_ratio", "2.60"), ("strategy", "gap_pct", "3.00"),
         ("sizing", "size_notional_usd", "15.00")]
 STRESSED = [("volatility", "realized_vol_24h_annualized", "45.00%"), ("volatility", "realized_vol_7d_annualized", "20.00%"),
             ("volatility", "vol_ratio_24h_7d", "2.25"), ("volatility", "move_1h_sigmas", "4.20"), ("volatility", "change_1h_pct", "-3.200"),
             ("venue", "mark_vs_pyth_bps", "3.0"), ("venue", "funding_rate_annualized", "-4.00%"),
             ("calendar", "events_within_24h", "CPI release (September 2026 data)"),
             ("sizing", "depth_to_size_ratio", "0.20"), ("sizing", "testnet_depth_same_side_within_0.5pct_oz", "0.0100"),
-            ("strategy", "maintenance_ratio", "1.30"), ("strategy", "equity_to_required_ratio", "0.80"), ("strategy", "gap_pct", "9.00"),
+            ("strategy", "maintenance_ratio", "1.30"), ("strategy", "stress_ratio_3sigma_1h", "1.05"), ("strategy", "equity_to_required_ratio", "0.80"), ("strategy", "gap_pct", "9.00"),
             ("sizing", "size_notional_usd", "52.00")]
 DIVERGENT = CALM[:5] + [("venue", "mark_vs_pyth_bps", "60.0")] + CALM[6:]
+CALM_MARKET = CALM[:8]  # volatility, venue and calendar only: the market is calm, the strategy is left as it is
 
-# question -> expected direction per scenario: ">" means the probability must exceed 0.5, "<" that it must be below
+# A real, healthy strategy: far from liquidation (ratio 19.5) but a few dollars under its INITIAL margin requirement (0.98). It used to draw 0.5-0.7 on
+# needs_top_up_soon because the two ratios were confused. No sizing section: nothing is out of line, so there is nothing to rebalance.
+SYNTH_HEALTHY = {**SYNTH_STRATEGY, "id": "calibration-healthy", "hedge_gap_units": 0.0, "hedge_gap_bps": 0, "value_usd": 196.56, "required_margin_usd": 199.70,
+                 "position": {**SYNTH_STRATEGY["position"], "margin_usd": 202.0, "maintenance_margin_usd": 10.0783}}
+
+# question -> expectation per scenario. ">" / "<" alone mean above / below 0.5; "<0.3" and ">0.7" name the limit.
 EXPECT = {
     "calm": {"volatility_elevated": "<", "funding_favors_shorts": ">", "abnormal_price_move": "<", "venue_price_divergence": "<",
              "high_impact_event_soon": "<", "liquidity_sufficient_for_size": ">", "needs_top_up_soon": "<", "should_rebalance": "<",
@@ -105,7 +111,18 @@ EXPECT = {
                  "liquidity_sufficient": "<", "excess_margin_safe_to_return": "<"},
     "divergent": {"venue_price_divergence": ">", "volatility_elevated": "<", "abnormal_price_move": "<", "needs_top_up_soon": "<",
                   "funding_favors_shorts": ">", "high_impact_event_soon": "<"},
+    "healthy_but_under_initial": {"needs_top_up_soon": "<0.3", "excess_margin_safe_to_return": "<0.5"},
 }
+# scenario -> (edits, which base snapshots it uses): market = setup and market questions with a proposed 0.05 oz hedge; strategy = a synthetic live strategy;
+# healthy = the real-looking strategy above
+SCENARIOS = {"calm": (CALM, ("market", "strategy")), "stressed": (STRESSED, ("market", "strategy")), "divergent": (DIVERGENT, ("market", "strategy")),
+             "healthy_but_under_initial": (CALM_MARKET, ("healthy",))}
+
+
+def meets(p: float, spec: str) -> bool:
+    """Does probability p satisfy an expectation such as ">" (above 0.5), "<" (below 0.5), "<0.3" or ">0.7"?"""
+    limit = float(spec[1:]) if len(spec) > 1 else 0.5
+    return p > limit if spec[0] == ">" else p < limit
 
 
 def _edited(snap, edits):
@@ -115,15 +132,16 @@ def _edited(snap, edits):
     for sec, key, val in edits:
         if sec in out.sections:
             out.sections[sec][key] = val
-    if "venue" in out.sections and any(k == "mark_vs_pyth_bps" for _, k, _ in edits):
-        out.sections["venue"]["hl_mark"] = out.sections["venue"]["hl_mark"]  # the bps field is what the question reads
     return out
 
 
 @agent_app.command("calibrate")
-def calibrate(market: str = typer.Option("XAU-HL", "--market")):
-    """Ask Jev the questions against three fixed states (calm, stressed, divergent) built from today's real snapshot with edited
-    numbers, print the answers, and exit 1 if any answer points the wrong way. Uses live Jev; not part of pytest."""
+def calibrate(market: str = typer.Option("XAU-HL", "--market"),
+              runs: int = typer.Option(1, "--runs", min=1, max=10, help="Repeat the whole check N times and show each cell's spread (Jev is not deterministic)"),
+              swing: float = typer.Option(0.3, "--swing", help="Warn when a cell moves by more than this between runs")):
+    """Ask Jev the questions against fixed states built from today's real snapshot with edited numbers (calm, stressed, divergent, and a healthy strategy
+    that is under its INITIAL margin but nowhere near liquidation), print the answers, and exit 1 if any answer points the wrong way in any run. With
+    --runs it shows how much each answer swings. Uses live Jev; not part of pytest."""
     from decimal import Decimal
 
     from rich.table import Table
@@ -136,46 +154,61 @@ def calibrate(market: str = typer.Option("XAU-HL", "--market")):
     markets = load_markets()
     if market not in markets:
         _fail(f"unknown market '{market}'")
-    base_market = build_snapshot(markets[market], None, size_oz=Decimal("0.05"))  # setup + market questions (a proposed 0.05 oz hedge)
-    base_strategy = build_snapshot(markets[market], SYNTH_STRATEGY)  # monitoring questions (a synthetic live strategy)
-    results: dict[str, dict[str, float]] = {}
+    bases = {"market": build_snapshot(markets[market], None, size_oz=Decimal("0.05")),  # setup + market questions (a proposed 0.05 oz hedge)
+             "strategy": build_snapshot(markets[market], SYNTH_STRATEGY),  # monitoring questions (a synthetic live strategy)
+             "healthy": build_snapshot(markets[market], SYNTH_HEALTHY)}
+    h = bases["healthy"].sections["strategy"]
+    console.print(f"healthy_but_under_initial state: maintenance_ratio {h['maintenance_ratio']}, equity_to_required_ratio {h['equity_to_required_ratio']}")
+    results: dict[str, dict[str, list[float]]] = {sc: {} for sc in SCENARIOS}
     tokens = 0
-    for name, edits in (("calm", CALM), ("stressed", STRESSED), ("divergent", DIVERGENT)):
-        results[name] = {}
-        for snap in (_edited(base_market, edits), _edited(base_strategy, edits)):
-            names = [n for n in question_names(snap) if n in EXPECT[name]]
-            if not names:
-                continue
-            try:
-                r = jev.ask(snap.to_state_text(), names)
-            except jev.JevError as e:
-                _fail(f"Jev failed on the {name} state: {e}")
-            tokens += r.usage.get("input_tokens", 0) + r.usage.get("output_tokens", 0)
-            results[name].update({n: float(p) for n, p in r.probabilities.items()})
-    table = Table(title=f"calibration (question set {QUESTION_SET_VERSION}, today's real snapshot with edited numbers)")
+    for _ in range(runs):
+        for name, (edits, which) in SCENARIOS.items():
+            for base in which:
+                snap = _edited(bases[base], edits)
+                names = [n for n in question_names(snap) if n in EXPECT[name]]
+                if not names:
+                    continue
+                try:
+                    r = jev.ask(snap.to_state_text(), names)
+                except jev.JevError as e:
+                    _fail(f"Jev failed on the {name} state: {e}")
+                tokens += r.usage.get("input_tokens", 0) + r.usage.get("output_tokens", 0)
+                for n, p in r.probabilities.items():
+                    results[name].setdefault(n, []).append(float(p))
+    table = Table(title=f"calibration (question set {QUESTION_SET_VERSION}, {runs} run{'s' if runs > 1 else ''}, today's real snapshot with edited numbers)")
     table.add_column("question", no_wrap=True)
-    for sc in EXPECT:
+    for sc in SCENARIOS:
         table.add_column(sc, justify="right")
-    wrong = []
+    wrong, swings = [], []
     for q in sorted({q for sc in EXPECT.values() for q in sc}):
         row = [q]
         for sc, exp in EXPECT.items():
             if q not in exp:
                 row.append("[dim]-[/]")
                 continue
-            p = results[sc].get(q)
-            ok = p is not None and ((p > 0.5) if exp[q] == ">" else (p < 0.5))
+            ps = results[sc].get(q, [])
+            if not ps:
+                wrong.append((sc, q, None, exp[q]))
+                row.append("[red]missing[/]")
+                continue
+            ok = all(meets(p, exp[q]) for p in ps)
+            spread = max(ps) - min(ps)
             if not ok:
-                wrong.append((sc, q, p, exp[q]))
-            row.append(f"{'[green]ok[/]' if ok else '[red]WRONG[/]'} {p:.2f} ({exp[q]}.5)" if p is not None else "[red]missing[/]")
+                wrong.append((sc, q, ps, exp[q]))
+            if spread > swing:
+                swings.append((sc, q, spread))
+            shown = f"{sum(ps) / len(ps):.2f}" + (f" [{min(ps):.2f}-{max(ps):.2f}]" if runs > 1 else "")
+            row.append(f"{'[green]ok[/]' if ok else '[red]WRONG[/]'} {shown} ({exp[q]}{'.5' if len(exp[q]) == 1 else ''})")
         table.add_row(*row)
-    console.print(table)
+    Console(width=170, highlight=False).print(table)  # wide, so each cell's [min-max] range is not truncated
     console.print(f"tokens used: {tokens}")
+    for sc, q, sp in swings:
+        console.print(f"[yellow]swing {sp:.2f} > {swing} between runs: {sc} / {q}[/]")
     if wrong:
-        for sc, q, p, e in wrong:
-            console.print(f"[red]{sc}: {q} = {p} but must be {e} 0.5[/]")
+        for sc, q, ps, e in wrong:
+            console.print(f"[red]{sc}: {q} = {ps} but must be {e}[/]")
         raise typer.Exit(1)
-    console.print("[green]all answers point the right way[/]")
+    console.print("[green]all answers point the right way" + ("" if swings else f" and none swings by more than {swing}") + "[/]")
 
 
 @agent_app.command("key")

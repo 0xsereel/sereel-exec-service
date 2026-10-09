@@ -33,6 +33,13 @@ def pct(frac, places: int = 2) -> str:
     return "n/a" if frac is None else fmt(D(str(frac)) * 100, places) + "%"
 
 
+# What a line MEANS, appended when the state text is rendered (the values themselves stay clean numbers). Two ratios that sound alike are very
+# different: confusing them made Jev call a healthy strategy a top-up risk.
+FIELD_LABELS = {
+    ("strategy", "maintenance_ratio"): "liquidation safety (below 1.0 = liquidation)",
+    ("strategy", "stress_ratio_3sigma_1h"): "liquidation safety after a 3-sigma adverse hour (gold up three times an hour's normal move; below 1.0 = liquidation)",
+    ("strategy", "equity_to_required_ratio"): "initial margin coverage (needed to open or grow the position; not liquidation risk)",
+}
 SECTION_LABELS = {"execution": "execution venue (not a market signal)", "sizing": "sizing"}
 
 
@@ -55,7 +62,7 @@ class Snapshot:
             sec = self.sections.get(name)
             if sec:
                 lines.append(f"[{SECTION_LABELS.get(name, name)}]")
-                lines += [f"{k}: {v}" for k, v in sec.items()]  # insertion order is fixed by build_snapshot
+                lines += [f"{k}: {v}" + (f"  # {FIELD_LABELS[(name, k)]}" if (name, k) in FIELD_LABELS else "") for k, v in sec.items()]  # order fixed by build_snapshot
         if self.absent:
             lines.append("[unavailable]")
             lines += [f"{k}: {v}" for k, v in sorted(self.absent.items())]
@@ -71,6 +78,23 @@ class Snapshot:
             return None if v in (None, "n/a") else D(v.rstrip("%"))  # a "%" value is returned as the percent number (21.56%% -> 21.56)
         except Exception:
             return None
+
+
+def stress_ratio(strategy: dict, hourly_sigma_pct: D | None) -> str:
+    """maintenance_ratio after a 3-sigma ADVERSE hour: the price of gold rising by three times one hour's normal move, which a short loses on. The
+    short's loss comes off equity and its maintenance requirement grows with the notional. Computed here so no model has to estimate how close an hour
+    of bad luck could get (n/a if the position, mark or volatility is missing)."""
+    pos = strategy.get("position") or {}
+    try:
+        size, mark = D(str(pos["size_units"])), D(str(pos["mark_price_usd"]))
+        maint, equity = D(str(pos["maintenance_margin_usd"])), D(str(strategy["value_usd"]))
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return "n/a"
+    if hourly_sigma_pct is None or size <= 0 or maint <= 0:
+        return "n/a"
+    move = 3 * hourly_sigma_pct / 100
+    stressed_equity, stressed_maint = equity - size * mark * move, maint * (1 + move)
+    return fmt(max(D(0), stressed_equity) / stressed_maint, 3)
 
 
 def _log_returns(closes: list[D]) -> list[float]:
@@ -235,6 +259,7 @@ def build_snapshot(market: Market, strategy: dict | None = None, now: datetime |
         liq, mk = pos.get("liquidation_price_usd"), pos.get("mark_price_usd")
         if liq and mk:
             sec["distance_to_liquidation_pct"] = fmt(abs(D(str(liq)) - D(str(mk))) / D(str(mk)) * 100, 2)
+        sec["stress_ratio_3sigma_1h"] = stress_ratio(strategy, snap.get("volatility", "hourly_sigma_pct"))
         snap.sections["strategy"] = sec
 
     _sizing(snap, strategy, size_oz)

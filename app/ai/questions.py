@@ -5,7 +5,7 @@ compares numbers instead of forming an impression (an earlier set let it answer 
 thresholds are mirrored in rules_signals.py. Changing any text means bumping QUESTION_SET_VERSION, which is recorded with every
 decision."""
 
-QUESTION_SET_VERSION = "2026-10-08.2"
+QUESTION_SET_VERSION = "2026-10-09.2"
 
 
 def _q(instructions: str, yes: str, no: str) -> dict:
@@ -14,11 +14,13 @@ def _q(instructions: str, yes: str, no: str) -> dict:
 
 MONITORING = {
     "needs_top_up_soon": _q(
-        "Will this hedge need more margin within the next hour to stay above a maintenance_ratio of 1.5? Read maintenance_ratio in "
-        "[strategy] and move_1h_sigmas in [volatility]. Answer yes if maintenance_ratio is below 1.5, or if it is below 1.8 and "
-        "move_1h_sigmas is above 2. Answer no if maintenance_ratio is at least 2.0.",
-        "maintenance_ratio < 1.5, or maintenance_ratio < 1.8 with move_1h_sigmas > 2",
-        "maintenance_ratio >= 2.0, or between 1.8 and 2.0 with move_1h_sigmas <= 2"),
+        "Will this hedge need more margin within the next hour to stay above a maintenance_ratio of 1.5? Read ONLY maintenance_ratio and "
+        "stress_ratio_3sigma_1h in [strategy]: both are liquidation safety, and the second is the ratio after a 3-sigma adverse hour. Ignore "
+        "equity_to_required_ratio: it is initial margin coverage, what opening or growing a position needs, and says nothing about liquidation risk. "
+        "Answer yes if maintenance_ratio is below 1.5 or stress_ratio_3sigma_1h is below 1.5. Answer no if maintenance_ratio is at least 2.0 and "
+        "stress_ratio_3sigma_1h is at least 1.5: a strategy that stays above 1.5 through a 3-sigma adverse hour cannot need margin within the hour.",
+        "maintenance_ratio < 1.5, or stress_ratio_3sigma_1h < 1.5",
+        "maintenance_ratio >= 2.0 and stress_ratio_3sigma_1h >= 1.5"),
     "should_rebalance": _q(
         "Is rebalancing now worth the trading fees? Read gap_pct and rebalance_band_pct in [strategy] and size_notional_usd in "
         "[sizing]. Answer yes only if gap_pct is above rebalance_band_pct AND size_notional_usd is at least 10.50. If there is no "
@@ -43,9 +45,9 @@ MONITORING = {
         "depth_to_size_ratio >= 2",
         "depth_to_size_ratio < 1 (between 1 and 2 is uncertain)"),
     "excess_margin_safe_to_return": _q(
-        "Can excess margin be returned without risking margin health for the next day? Read maintenance_ratio and "
-        "equity_to_required_ratio in [strategy]. Answer yes if maintenance_ratio is above 3.0 AND equity_to_required_ratio is above "
-        "2.0. Answer no if either is below its threshold.",
+        "Can excess margin be returned without risking margin health for the next day? Read maintenance_ratio (liquidation safety) and "
+        "equity_to_required_ratio (initial margin coverage) in [strategy]. Answer yes if maintenance_ratio is above 3.0 AND "
+        "equity_to_required_ratio is above 2.0. Answer no if either is below its threshold.",
         "maintenance_ratio > 3.0 and equity_to_required_ratio > 2.0",
         "maintenance_ratio <= 3.0 or equity_to_required_ratio <= 2.0"),
     "high_impact_event_soon": _q(

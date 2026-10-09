@@ -751,7 +751,13 @@ moves money**: proposals wait for the owner. One strategy's failure never stops 
    strategy's cash can margin it. `target_size` comes from the strategy's own settings.
 4. `return_excess`: `excess_margin_safe_to_return` and equity > 2x the requirement. `amount_usd` leaves 1.5x the requirement.
 
-Every parameter is a string computed from the strategy's state; the model never supplies one. Hard caps: no action on a strategy that
+Every parameter is a string computed from the strategy's state; the model never supplies one.
+A signal at or above the suggest threshold (0.50) that a deterministic check drops is never reported as "no rule fired": the decision is `none` with a
+reason naming each such signal, its level, the check that overruled it and that check's numbers (for example "needs_top_up_soon = 0.71 (suggest level, between
+0.50 and 0.80) was overruled by the top-up amount check: maintenance ratio 19.50 is already at or above the 2 a top-up would restore ... so no action"). The
+checks are: the top-up amount (nothing to add), liquidity (below 0.5), the rebalance (at target, under the venue minimum, or needs margin first), and the two
+return-excess checks (equity not above 2x the requirement, or no margin above 1.5x). The same text is stored, explained in the feed and logged under `overruled`.
+A quiet cycle with nothing near a threshold says which signal was highest. Hard caps: no action on a strategy that
 is not `active` or has no owner. Only a rebalance by a delegated agent can ever be `execute` (delegation arrives in the next step);
 `execute` is downgraded to `propose` when the execution testnet is more than `AGENT_EXEC_MAX_DIVERGENCE_BPS` (50) from Pyth, or one
 action was already executed in the last `AGENT_EXEC_CAP_S` (10 minutes). Top-ups and returns of margin never execute.

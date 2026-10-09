@@ -13,6 +13,7 @@ from .state import Snapshot
 
 D = Decimal
 HOLD_QUESTIONS = ("venue_price_divergence", "abnormal_price_move")
+TRIGGER_QUESTIONS = ("needs_top_up_soon", "should_rebalance", "excess_margin_safe_to_return", *HOLD_QUESTIONS)
 LIQUIDITY_FLOOR = D("0.5")  # a rebalance also needs liquidity_sufficient at least this
 
 
@@ -20,14 +21,19 @@ LIQUIDITY_FLOOR = D("0.5")  # a rebalance also needs liquidity_sufficient at lea
 class Decision:
     kind: str  # none | hold | suggest | propose | execute
     action: dict | None = None  # {"type", "params"}
-    reason: str = ""  # which rule fired, one deterministic line
+    reason: str = ""  # which rule fired, or which check overruled a signal and why: one deterministic line
     downgraded_from: str | None = None
+    overruled: tuple[str, ...] = ()  # signals at or above the suggest threshold that a deterministic check dropped, each with the check and its numbers
 
 
 def _level(p: D | None, act: D, suggest: D) -> str | None:
     if p is None:
         return None
     return "act" if p >= act else "suggest" if p >= suggest else None
+
+
+def _band_text(act: D, suggest: D, lvl: str) -> str:
+    return f"at or above {act}" if lvl == "act" else f"between {suggest} and {act}"
 
 
 def _equity_over_required(view: dict) -> bool:
@@ -52,26 +58,50 @@ def decide(snap: Snapshot, view: dict, p: dict[str, D], *, act: D | None = None,
         reason = f"{worst} = {p[worst]:.2f}: do not trade this cycle"
         return Decision("hold" if lvl == "act" else "suggest", {"type": "hold", "params": {}}, reason)
 
-    # 2-4. the rest, first match wins
+    # 2-4. the rest, first match wins. A signal at or above the suggest threshold that a deterministic check drops is RECORDED, never silently lost.
     candidates: list[tuple[str, str, dict, str]] = []  # (question, level, action, reason)
+    overruled: list[str] = []
+
+    def dropped(q: str, lvl: str, check: str) -> None:
+        overruled.append(f"{q} = {p[q]:.2f} ({'act' if lvl == 'act' else 'suggest'} level, {_band_text(act, suggest, lvl)}) was overruled by {check}")
+
+    ratio = actions.maintenance_ratio(view)
+    ratio_text = f"{ratio:.2f}" if ratio is not None else "unknown"
     lvl = _level(p.get("needs_top_up_soon"), act, suggest)
     amount = actions.top_up_amount(view) if lvl else None
     if lvl and amount:
         candidates.append(("needs_top_up_soon", lvl, {"type": "top_up", "params": {"amount_usd": amount}},
                            f"needs_top_up_soon = {p['needs_top_up_soon']:.2f}"))
+    elif lvl:
+        dropped("needs_top_up_soon", lvl, f"the top-up amount check: maintenance ratio {ratio_text} is already at or above the {actions.TARGET_RATIO} a top-up would "
+                                          "restore and the margin covers the requirement, so there is nothing to add")
     lvl = _level(p.get("should_rebalance"), act, suggest)
-    if lvl and p.get("liquidity_sufficient", D(1)) >= LIQUIDITY_FLOOR:
-        params, why = actions.rebalance_params(view)
-        if params:
+    if lvl:
+        liq = p.get("liquidity_sufficient", D(1))
+        params, why = actions.rebalance_params(view) if liq >= LIQUIDITY_FLOOR else (None, None)
+        if liq < LIQUIDITY_FLOOR:
+            dropped("should_rebalance", lvl, f"the liquidity check: liquidity_sufficient = {liq:.2f} is below {LIQUIDITY_FLOOR}")
+        elif not params:
+            dropped("should_rebalance", lvl, f"the rebalance check: {why}")
+        else:
             candidates.append(("should_rebalance", lvl, {"type": "rebalance", "params": params},
-                               f"should_rebalance = {p['should_rebalance']:.2f}, liquidity_sufficient = {p.get('liquidity_sufficient', D(1)):.2f}"))
+                               f"should_rebalance = {p['should_rebalance']:.2f}, liquidity_sufficient = {liq:.2f}"))
     lvl = _level(p.get("excess_margin_safe_to_return"), act, suggest)
-    amount = actions.return_excess_amount(view) if lvl and _equity_over_required(view) else None
-    if lvl and amount:
-        candidates.append(("excess_margin_safe_to_return", lvl, {"type": "return_excess", "params": {"amount_usd": amount}},
-                           f"excess_margin_safe_to_return = {p['excess_margin_safe_to_return']:.2f}"))
+    if lvl:
+        amount = actions.return_excess_amount(view) if _equity_over_required(view) else None
+        if amount:
+            candidates.append(("excess_margin_safe_to_return", lvl, {"type": "return_excess", "params": {"amount_usd": amount}},
+                               f"excess_margin_safe_to_return = {p['excess_margin_safe_to_return']:.2f}"))
+        elif not _equity_over_required(view):
+            eq, req = view.get("value_usd"), view.get("required_margin_usd")
+            dropped("excess_margin_safe_to_return", lvl, f"the equity check: equity ${eq} is not above 2x the required margin ${req}")
+        else:
+            dropped("excess_margin_safe_to_return", lvl, f"the excess check: no margin is left above {actions.EXCESS_FLOOR}x the requirement to return")
     if not candidates:
-        return Decision("none", reason="no rule fired")
+        if overruled:
+            return Decision("none", reason="; ".join(overruled) + ", so no action", overruled=tuple(overruled))
+        top = max((q for q in TRIGGER_QUESTIONS if q in p), key=lambda q: p[q], default=None)  # liquidity and the calendar are context, not triggers
+        return Decision("none", reason=f"no signal reached the suggest threshold ({suggest}); highest: {top} = {p[top]:.2f}" if top else "no signals")
     _, lvl, action, reason = candidates[0]
     if lvl == "suggest":
         return Decision("suggest", action, reason + " (between the suggest and act thresholds)")

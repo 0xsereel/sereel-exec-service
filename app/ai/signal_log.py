@@ -54,6 +54,8 @@ def record(strategy_id: str, snap, sig, decision) -> None:
     if jr is not None:
         entry["jev"] = {"model": jr.model, "latency_ms": jr.latency_ms, "usage": jr.usage, "auth_header": jr.auth_header,
                         "response": jr.raw}  # the full JSON Jev returned, as received
+    if getattr(decision, "overruled", ()):
+        entry["overruled"] = list(decision.overruled)  # signals a deterministic check dropped, each with the check and its numbers
     if sig.jev_error:
         entry["jev_error"] = sig.jev_error  # why the rules answered instead
     if snap.absent:

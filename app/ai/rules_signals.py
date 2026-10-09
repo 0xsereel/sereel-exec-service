@@ -20,9 +20,9 @@ def answer(snap: Snapshot, names: list[str]) -> dict[str, Decimal]:
     out: dict[str, Decimal] = {}
     for n in names:
         if n == "needs_top_up_soon":
-            ratio, sig = g("strategy", "maintenance_ratio"), g("volatility", "move_1h_sigmas")
-            out[n] = MAYBE if ratio is None else YES if ratio < D("1.5") or (ratio < D("1.8") and (sig or 0) > 2) \
-                else NO if ratio >= D("2.0") else MAYBE
+            ratio, stress = g("strategy", "maintenance_ratio"), g("strategy", "stress_ratio_3sigma_1h")
+            out[n] = MAYBE if ratio is None else YES if ratio < D("1.5") or (stress is not None and stress < D("1.5")) \
+                else NO if ratio >= D("2.0") and (stress is None or stress >= D("1.5")) else MAYBE
         elif n == "should_rebalance":
             gap, band, usd = g("strategy", "gap_pct"), g("strategy", "rebalance_band_pct"), g("sizing", "size_notional_usd")
             out[n] = NO if gap is None or band is None or usd is None else YES if gap > band and usd >= D("10.5") else NO

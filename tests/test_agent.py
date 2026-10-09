@@ -552,3 +552,76 @@ def test_strategy_rows_carry_the_agent_fields_always(api, fakechain, monkeypatch
     assert get(api, s["id"])["agent_mode"] is None
     pending = api.post("/strategies", json={**__import__("test_strategies").BODY}).json()
     assert pending["has_unread_proposal"] is False and "agent_mode" in pending
+
+
+# ---- a signal between the thresholds, or overruled, is never reported as "no rule fired" ---------------------------------------------------------------
+
+def test_the_thresholds_are_050_and_080_by_default():
+    assert (settings.agent_suggest_threshold, settings.agent_act_threshold) == (D("0.50"), D("0.80"))
+
+
+def test_0_71_is_between_the_thresholds_so_it_is_a_suggestion_when_there_is_something_to_suggest():
+    d = decide(snap(), view(), P(needs_top_up_soon="0.71"))  # ratio 1.8: a top-up of $10 would restore 2.0
+    assert d.kind == "suggest" and d.action == {"type": "top_up", "params": {"amount_usd": "10"}} and d.overruled == ()
+    assert "needs_top_up_soon = 0.71" in d.reason and "between the suggest and act thresholds" in d.reason
+    assert decide(snap(), view(), P(needs_top_up_soon="0.79")).kind == "suggest" and decide(snap(), view(), P(needs_top_up_soon="0.80")).kind == "propose"
+    assert decide(snap(), view(), P(needs_top_up_soon="0.50")).kind == "suggest"  # the suggest threshold itself counts
+
+
+def test_0_71_overruled_by_a_deterministic_check_says_which_check_and_with_what_numbers():
+    healthy = view(value_usd=200.0)  # maintenance 50, equity 200: ratio 4.0, margin 150 covers the 100 requirement
+    d = decide(snap(), healthy, P(needs_top_up_soon="0.71"))
+    assert d.kind == "none" and d.action is None and len(d.overruled) == 1
+    assert d.reason == ("needs_top_up_soon = 0.71 (suggest level, between 0.50 and 0.80) was overruled by the top-up amount check: maintenance ratio 4.00 is already "
+                        "at or above the 2 a top-up would restore and the margin covers the requirement, so there is nothing to add, so no action")
+    assert "no rule fired" not in d.reason
+    act = decide(snap(), healthy, P(needs_top_up_soon="0.93"))
+    assert act.kind == "none" and "(act level, at or above 0.80)" in act.reason and "0.93" in act.reason
+
+
+def test_the_overrule_names_the_right_check_for_every_rule():
+    d = decide(snap(), view(), P(should_rebalance="0.9", liquidity_sufficient="0.30"))
+    assert d.kind == "none" and "should_rebalance = 0.90" in d.reason and "the liquidity check: liquidity_sufficient = 0.30 is below 0.5" in d.reason
+    d = decide(snap(), view(hedge_gap_units=0.002), P(should_rebalance="0.9"))
+    assert "the rebalance check:" in d.reason and "minimum order" in d.reason
+    d = decide(snap(), view(position={**view()["position"], "margin_usd": 50.0}), P(should_rebalance="0.9"))
+    assert "the rebalance check:" in d.reason and "top up first" in d.reason
+    d = decide(snap(), view(hedge_gap_units=0.0), P(should_rebalance="0.9"))
+    assert "the rebalance check: the hedge is already at its target" in d.reason
+    d = decide(snap(), view(value_usd=150.0), P(excess_margin_safe_to_return="0.9"))
+    assert "the equity check: equity $150.0 is not above 2x the required margin $100.0" in d.reason
+    d = decide(snap(), view(value_usd=300.0, position={"margin_usd": 140.0, "maintenance_margin_usd": 30.0, "mark_price_usd": 2650.0, "size_units": 0.12}, hedge_gap_units=0.0),
+               P(excess_margin_safe_to_return="0.9"))
+    assert "the excess check: no margin is left above 1.5x the requirement" in d.reason and "equity" not in d.reason
+
+
+def test_several_overruled_signals_are_all_listed():
+    d = decide(snap(), view(value_usd=200.0, hedge_gap_units=0.0), P(needs_top_up_soon="0.7", should_rebalance="0.6"))
+    assert d.kind == "none" and len(d.overruled) == 2 and "needs_top_up_soon = 0.70" in d.reason and "should_rebalance = 0.60" in d.reason
+    assert d.reason.endswith(", so no action")
+
+
+def test_a_quiet_cycle_says_how_close_the_nearest_signal_was_not_just_that_nothing_fired():
+    d = decide(snap(), view(value_usd=200.0), P(needs_top_up_soon="0.49", should_rebalance="0.10"))
+    assert d.kind == "none" and d.overruled == () and d.reason == "no signal reached the suggest threshold (0.50); highest: needs_top_up_soon = 0.49"
+    assert "no rule fired" not in decide(snap(), view(), P()).reason
+
+
+def test_an_overruled_signal_does_not_hide_a_hold_or_another_rule():
+    assert decide(snap(), view(value_usd=200.0), P(needs_top_up_soon="0.71", venue_price_divergence="0.9")).kind == "hold"
+    d = decide(snap(), view(value_usd=200.0), P(needs_top_up_soon="0.71", should_rebalance="0.9"))
+    assert d.kind == "propose" and d.action["type"] == "rebalance"  # the top-up was overruled; the rebalance still fires
+
+
+def test_the_stored_decision_the_explanation_and_the_log_all_carry_the_overrule(api, fakechain, cycle, monkeypatch):
+    from app.ai import signal_log
+    calls, probs = cycle
+    sid = active(api, fakechain)["id"]
+    probs.update(needs_top_up_soon="0.71")
+    row = decisions.out(loop.run_strategy(sid))
+    assert row["decision"] == "none" and row["reason"].startswith("needs_top_up_soon = 0.71 (suggest level, between 0.50 and 0.80) was overruled by the top-up amount check")
+    assert row["explanation"]["headline"] == "No action: a signal was overruled by a check" and row["explanation"]["explanation"] == row["reason"]
+    assert "no rule fired" not in json.dumps(row) and calls["llm"] == 0  # a quiet cycle still never calls the model
+    entry = signal_log.tail(1)[0]
+    assert entry["overruled"] == [row["reason"].replace(", so no action", "")] and entry["reason"] == row["reason"]
+    assert api.get(f"/strategies/{sid}/agent/decisions").json()[0]["reason"] == row["reason"]

@@ -31,7 +31,7 @@ def test_every_cycle_writes_one_line_with_every_jev_answer_and_the_decision(api,
     got = lines()
     assert len(got) == 2 and got[0]["strategy_id"] == sid
     e = got[0]
-    assert e["source"] == "jev" and e["decision"] == "none" and e["action"] is None and e["reason"] == "no rule fired"
+    assert e["source"] == "jev" and e["decision"] == "none" and e["action"] is None and e["reason"].startswith("no signal reached the suggest threshold (0.50); highest: should_rebalance = 0.31")
     assert e["probabilities"]["should_rebalance"] == "0.31" and e["probabilities"]["needs_top_up_soon"] == "0.05"
     assert set(e["probabilities"]) >= {"needs_top_up_soon", "should_rebalance", "abnormal_price_move", "venue_price_divergence", "liquidity_sufficient",
                                        "excess_margin_safe_to_return", "high_impact_event_soon"} - {"liquidity_sufficient"}
@@ -127,7 +127,7 @@ def test_the_cli_shows_the_latest_entries_filtered_by_strategy(api, fakechain, c
     probs.update(should_rebalance="0.31")
     loop.run_cycle()
     r = runner.invoke(cli_app, ["agent", "log", "-n", "5"])
-    assert r.exit_code == 0 and a[:8] in r.output and b[:8] in r.output and "should_rebalance=0.31" in r.output and "jev 5ms" in r.output and "no rule fired" in r.output
+    assert r.exit_code == 0 and a[:8] in r.output and b[:8] in r.output and "should_rebalance=0.31" in r.output and "jev 5ms" in r.output and "no signal reached" in r.output
     only = runner.invoke(cli_app, ["agent", "log", "--strategy", a[:8]])
     assert a[:8] in only.output and b[:8] not in only.output
     raw = runner.invoke(cli_app, ["agent", "log", "--raw", "-n", "1"])

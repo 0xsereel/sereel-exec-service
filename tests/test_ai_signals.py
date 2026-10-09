@@ -396,7 +396,7 @@ def test_jev_failure_falls_back_to_rules_and_says_so(net, key):
 
 
 def test_question_registry_is_consistent():
-    assert NEEDS_STRATEGY <= set(MONITORING) and "high_impact_event_soon" in MONITORING and QUESTION_SET_VERSION == "2026-10-08.2"
+    assert NEEDS_STRATEGY <= set(MONITORING) and "high_impact_event_soon" in MONITORING and QUESTION_SET_VERSION == "2026-10-09.2"
     assert set(SETUP) == {"volatility_elevated", "funding_favors_shorts", "liquidity_sufficient_for_size"}
     for q in {**MONITORING, **SETUP}.values():
         assert q["type"] == "noul" and q["instructions"].endswith(".") and set(q["criteria"]) == {"true", "false"}
@@ -409,7 +409,7 @@ FIELDS_READ = {  # question -> (state field names it names, a threshold phrase i
     "funding_favors_shorts": (["funding_rate_annualized"], ["+2%", "longs pay shorts"]),
     "liquidity_sufficient_for_size": (["size_oz", "depth_to_size_ratio"], ["TESTNET", "2"]),
     "liquidity_sufficient": (["size_oz", "depth_to_size_ratio"], ["TESTNET", "2"]),
-    "needs_top_up_soon": (["maintenance_ratio", "move_1h_sigmas"], ["1.5", "1.8"]),
+    "needs_top_up_soon": (["maintenance_ratio", "stress_ratio_3sigma_1h"], ["1.5", "2.0", "3-sigma"]),
     "should_rebalance": (["gap_pct", "rebalance_band_pct", "size_notional_usd"], ["10.50"]),
     "abnormal_price_move": (["move_1h_sigmas"], ["3"]),
     "excess_margin_safe_to_return": (["maintenance_ratio", "equity_to_required_ratio"], ["3.0", "2.0"]),
@@ -515,3 +515,69 @@ def test_sampler_writes_both_sources_and_prunes_old_rows(net):
 def test_a_failing_source_does_not_stop_the_other(net):
     net.setattr(pyth, "get_price", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     assert samples.sample_once() == 1
+
+
+# ---- liquidation safety vs initial margin coverage: two ratios that must never be confused -------------------------------------------------------------
+
+def test_the_two_ratios_are_labelled_in_the_state_text_and_the_values_stay_clean_numbers(net):
+    s = build_snapshot(M, STRATEGY, NOW)
+    t = s.to_state_text()
+    assert "maintenance_ratio: 10.833  # liquidation safety (below 1.0 = liquidation)" in t
+    assert "equity_to_required_ratio: 0.79  # initial margin coverage (needed to open or grow the position; not liquidation risk)" in t
+    assert re.search(r"stress_ratio_3sigma_1h: \d+\.\d{3}  # liquidation safety after a 3-sigma adverse hour", t)
+    assert s.get("strategy", "maintenance_ratio") == D("10.833") and s.get("strategy", "equity_to_required_ratio") == D("0.79")  # labels are render-only
+
+
+def test_the_stress_ratio_is_the_maintenance_ratio_after_a_3_sigma_adverse_hour(net):
+    s = build_snapshot(M, STRATEGY, NOW)
+    sigma = s.get("volatility", "hourly_sigma_pct")
+    move = 3 * sigma / 100
+    size, mark, maint, equity = D("0.12"), D("4126.5"), D(12), D(130)
+    expected = ((equity - size * mark * move) / (maint * (1 + move))).quantize(D("0.001"))
+    assert s.get("strategy", "stress_ratio_3sigma_1h") == expected and expected < s.get("strategy", "maintenance_ratio")  # an adverse hour only lowers it
+    dead = build_snapshot(M, {**STRATEGY, "value_usd": 0.1}, NOW)  # the move costs about $3.4 and equity is $0.10: liquidation, never a negative ratio
+    assert dead.get("strategy", "stress_ratio_3sigma_1h") == D("0.000")
+    flat = build_snapshot(M, {**STRATEGY, "position": {**STRATEGY["position"], "size_units": 0.0}}, NOW)
+    assert flat.sections["strategy"]["stress_ratio_3sigma_1h"] == "n/a"  # nothing to stress
+
+
+def test_needs_top_up_soon_is_about_liquidation_safety_only(net):
+    from app.ai.questions import MONITORING
+    q = MONITORING["needs_top_up_soon"]
+    text = q["instructions"] + " " + " ".join(q["criteria"].values())
+    assert "Ignore equity_to_required_ratio" in q["instructions"] and "initial margin coverage" in q["instructions"] and "says nothing about liquidation risk" in q["instructions"]
+    assert "equity_to_required_ratio" not in " ".join(q["criteria"].values()) and "move_1h_sigmas" not in text  # nothing in the yes/no criteria points at it
+    assert "stress_ratio_3sigma_1h" in q["criteria"]["true"] and "maintenance_ratio" in q["criteria"]["false"]
+    ex = MONITORING["excess_margin_safe_to_return"]["instructions"]
+    assert "(liquidation safety)" in ex and "(initial margin coverage)" in ex  # the one question that uses both says which is which
+
+
+@pytest.mark.parametrize("ratio,stress,expected", [
+    ("19.5", "19.1", "no"), ("2.0", "1.5", "no"), ("2.0", "1.49", "yes"), ("3.0", "1.2", "yes"),  # a bad hour matters even when today's ratio looks fine
+    ("1.49", "5.0", "yes"), ("1.8", "1.7", "maybe"), ("1.5", "1.5", "maybe"), ("2.0", "n/a", "no"), ("1.2", "n/a", "yes"),
+])
+def test_the_rules_fallback_follows_the_same_two_ratios(net, ratio, stress, expected):
+    snap = build_snapshot(M, STRATEGY, NOW)
+    snap.sections["strategy"]["maintenance_ratio"], snap.sections["strategy"]["stress_ratio_3sigma_1h"] = ratio, stress
+    snap.sections["strategy"]["equity_to_required_ratio"] = "0.98"  # initial coverage under 1.0 must change nothing here
+    p = rules_signals.answer(snap, ["needs_top_up_soon"])["needs_top_up_soon"]
+    assert {"yes": p >= D("0.9"), "no": p <= D("0.1"), "maybe": D("0.4") <= p <= D("0.6")}[expected], (ratio, stress, p)
+
+
+def test_the_calibration_covers_the_healthy_but_under_initial_case(net):
+    from cli import agent as cal
+    assert "healthy_but_under_initial" in cal.EXPECT and cal.EXPECT["healthy_but_under_initial"] == {"needs_top_up_soon": "<0.3", "excess_margin_safe_to_return": "<0.5"}
+    snap = build_snapshot(M, cal.SYNTH_HEALTHY, NOW)
+    st = snap.sections["strategy"]
+    assert (st["maintenance_ratio"], st["equity_to_required_ratio"]) == ("19.503", "0.98") and snap.get("strategy", "stress_ratio_3sigma_1h") > D("15")
+    assert "sizing" not in snap.sections  # nothing to rebalance
+    edited = cal._edited(snap, cal.CALM_MARKET)
+    assert edited.sections["strategy"] == st and edited.sections["volatility"]["vol_ratio_24h_7d"] == "0.94"  # the market is calmed, the strategy is untouched
+    assert cal.SCENARIOS["healthy_but_under_initial"] == (cal.CALM_MARKET, ("healthy",))
+
+
+@pytest.mark.parametrize("p,spec,ok", [(0.29, "<0.3", True), (0.30, "<0.3", False), (0.33, "<0.3", False), (0.49, "<", True), (0.5, "<", False),
+                                       (0.51, ">", True), (0.7, ">0.7", False), (0.71, ">0.7", True)])
+def test_expectations_accept_a_numeric_limit_or_the_default_half(p, spec, ok):
+    from cli import agent as cal
+    assert cal.meets(p, spec) is ok

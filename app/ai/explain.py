@@ -35,6 +35,8 @@ def template(d: Decision, view: dict, snap: Snapshot) -> dict:
     gap = snap.sections.get("strategy", {}).get("gap_oz", "n/a")
     note = {"hold": "No trading until the price sources agree again.", "top_up": "Margin is the only protection against liquidation.",
             "rebalance": "A rebalance trades on the thin testnet book and may not fully fill.", "return_excess": ""}.get(t, "")
+    if d.kind == "none" and d.overruled:  # a signal said "act" and a deterministic check said no: say which and why, in the server's words
+        return {"headline": "No action: a signal was overruled by a check", "explanation": d.reason[:600], "risk_note": ""}
     if d.kind == "none":
         return {"headline": "No action needed", "explanation": f"The hedge is within its limits (maintenance ratio {ratio}, gap {gap} oz).", "risk_note": ""}
     verb = "Suggested" if d.kind == "suggest" else "Proposed"
