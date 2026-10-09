@@ -86,6 +86,15 @@ async def edit(sid: str, request: Request, org: str = ORG):
     return service.strategy_out(service.edit_settings(sid, params, authorization, org))
 
 
+@router.post("/{sid}/exposure")
+async def update_exposure(sid: str, request: Request, org: str = ORG):
+    """Owner-signed `update_exposure` {exposure_oz}: set the fund's total exposure in oz. Moves the target only (no trade); the agent rebalances
+    or proposes on its next check. Delegates cannot sign it. The path an `update_exposure` action draft from the chat is approved through."""
+    _, authorization, params = await signed_body(request, ("exposure_oz",))
+    authmod.validate_params(params)
+    return service.strategy_out(service.update_exposure(sid, params, authorization, org))
+
+
 @router.post("/{sid}/rebalance")
 async def rebalance(sid: str, request: Request, force: bool = False, org: str = ORG):
     """Move the hedge to its target if the gap exceeds the rebalance band (`?force=true` trades regardless). Signed."""

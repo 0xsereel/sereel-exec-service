@@ -35,7 +35,7 @@ def test_every_cycle_writes_one_line_with_every_jev_answer_and_the_decision(api,
     assert e["probabilities"]["should_rebalance"] == "0.31" and e["probabilities"]["needs_top_up_soon"] == "0.05"
     assert set(e["probabilities"]) >= {"needs_top_up_soon", "should_rebalance", "abnormal_price_move", "venue_price_divergence", "liquidity_sufficient",
                                        "excess_margin_safe_to_return", "high_impact_event_soon"} - {"liquidity_sufficient"}
-    assert e["jev"] == {"model": "jev-1.13.0", "latency_ms": 5, "usage": {}, "auth_header": "Authorization: Bearer"}
+    assert e["jev"] == {"model": "jev-1.13.0", "latency_ms": 5, "usage": {}, "auth_header": "Authorization: Bearer", "response": {}}
     assert len(e["state_hash"]) == 64 and e["signals_network"] == "mainnet" and e["question_set_version"] and e["at"].endswith("Z")
     assert "state" not in e  # the state text is off unless asked for
     console = [r.getMessage() for r in caplog.records if "signals (" in r.getMessage()]
@@ -141,3 +141,78 @@ def test_the_cli_says_when_the_log_is_off(monkeypatch):
     monkeypatch.setattr(settings, "agent_log_file", "")
     r = runner.invoke(cli_app, ["agent", "log"])
     assert r.exit_code == 1 and "log is off" in r.output
+
+
+def realistic_jev(monkeypatch, probs):
+    """A Jev that returns the full JSON the real one does (model, answers, usage), so the log can be checked against it."""
+    def ask(state_text, names, client=None):
+        raw = {"model": "jev-1.13.0", "answers": {n: {"type": "noul", "noul": float(probs.get(n, "0.05"))} for n in names},
+               "usage": {"input_tokens": 1832, "output_tokens": 131}}
+        return jev.JevResult({n: D(probs.get(n, "0.05")) for n in names}, "jev-1.13.0", 549, "Authorization: Bearer", raw["usage"], raw)
+    monkeypatch.setattr(jev, "ask", ask)
+
+
+def test_the_full_jev_json_is_logged_exactly_as_received_in_the_file_and_the_console(api, fakechain, cycle, monkeypatch, caplog):
+    realistic_jev(monkeypatch, {"should_rebalance": "0.31", "needs_top_up_soon": "0.59"})
+    sid = active(api, fakechain)["id"]
+    with caplog.at_level(logging.INFO, logger="sereel.agent"):
+        loop.run_cycle()
+    e = lines()[-1]
+    resp = e["jev"]["response"]
+    assert set(resp) == {"model", "answers", "usage"} and resp["model"] == "jev-1.13.0" and resp["usage"] == {"input_tokens": 1832, "output_tokens": 131}
+    assert resp["answers"]["needs_top_up_soon"] == {"type": "noul", "noul": 0.59} and resp["answers"]["should_rebalance"] == {"type": "noul", "noul": 0.31}
+    assert e["jev"]["latency_ms"] == 549 and e["jev"]["usage"] == resp["usage"]
+    jev_lines = [r.getMessage() for r in caplog.records if "jev response:" in r.getMessage()]
+    assert len(jev_lines) == 1 and jev_lines[0].startswith(f"agent {sid[:8]} jev response: ")
+    assert json.loads(jev_lines[0].split("jev response: ", 1)[1]) == resp  # the console JSON is the same document, parseable as is
+
+
+def test_the_rules_fallback_has_no_jev_response_to_log(api, fakechain, cycle, monkeypatch, caplog):
+    monkeypatch.setattr(jev, "ask", lambda *a, **k: (_ for _ in ()).throw(jev.JevError("HTTP 503")))
+    active(api, fakechain)
+    with caplog.at_level(logging.INFO, logger="sereel.agent"):
+        loop.run_cycle()
+    assert "jev" not in lines()[-1] and not any("jev response:" in r.getMessage() for r in caplog.records)
+
+
+def test_the_cli_raw_view_carries_the_full_jev_json(api, fakechain, cycle, monkeypatch):
+    realistic_jev(monkeypatch, {"should_rebalance": "0.31"})
+    active(api, fakechain)
+    loop.run_cycle()
+    raw = json.loads(runner.invoke(cli_app, ["agent", "log", "--raw", "-n", "1"]).output.strip().splitlines()[-1])
+    assert raw["jev"]["response"]["answers"]["should_rebalance"]["noul"] == 0.31
+
+
+class FakeSched:
+    def __init__(self):
+        self.jobs = []
+
+    def add_job(self, fn, trigger, **kw):
+        self.jobs.append((trigger, kw))
+
+
+def test_startup_says_whether_the_agent_is_on_and_the_first_cycle_runs_within_seconds(monkeypatch, caplog):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(settings, "agent_enabled", False)
+    s = FakeSched()
+    with caplog.at_level(logging.INFO, logger="sereel.agent"):
+        loop.register(s)
+    assert s.jobs == [] and any("agent is OFF (AGENT_ENABLED=false)" in r.getMessage() and "Jev is never called" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    monkeypatch.setattr(settings, "agent_enabled", True)
+    monkeypatch.setattr(settings, "agent_interval_s", 60)
+    with caplog.at_level(logging.INFO, logger="sereel.agent"):
+        loop.register(s)
+    (trigger, kw), = s.jobs
+    assert trigger == "interval" and kw["seconds"] == 60 and kw["id"] == "agent-cycle"
+    assert timedelta(0) < kw["next_run_time"] - datetime.now(timezone.utc) <= timedelta(seconds=loop.FIRST_CYCLE_DELAY_S)  # not a whole interval's wait
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "agent is ON: a cycle runs every 60s" in msg and "whether or not anything is done" in msg and "agent_signals.jsonl" in msg
+
+
+def test_the_chatty_libraries_are_quieted_so_the_agent_lines_stand_out():
+    import cli.sereel_cli  # noqa: F401  (importing it configures logging, as `sereel serve` does)
+    for name in ("httpx", "httpcore", "apscheduler.executors.default"):
+        assert logging.getLogger(name).level == logging.WARNING, name
+    assert logging.getLogger("sereel.agent").level == logging.NOTSET  # the service's own loggers are left alone: they still print at the root's INFO

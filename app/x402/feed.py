@@ -93,8 +93,8 @@ def executed_settings(strategy_id: str) -> tuple[Decimal, Decimal, Decimal]:
                                     .order_by(Action.created_at.desc(), Action.id)).all()
                   if a.action == "deploy" or (a.record or {}).get("traded")]
         since = trades[0].created_at if trades else None
-        edits = s.exec(select(Action).where(Action.strategy_id == strategy_id, Action.action == "edit_hedge_settings")
-                       .order_by(Action.created_at, Action.id)).all()
+        edits = s.exec(select(Action).where(Action.strategy_id == strategy_id, Action.action.in_(("edit_hedge_settings", "update_exposure")))
+                       .order_by(Action.created_at, Action.id)).all()  # an exposure update is an unexecuted edit too: it must not show in what is sold
     pending = [e for e in edits if since is None or e.created_at > since]
     if pending:  # the earliest unexecuted edit's `from` is what was true at the last trade
         before = (pending[0].record or {}).get("from") or {}

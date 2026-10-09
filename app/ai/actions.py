@@ -93,4 +93,4 @@ def draft(view: dict, kind: str) -> tuple[dict | None, str]:
             return None, "No excess margin to return: margin is within 1.5x of the requirement."
         return {"type": "return_excess", "params": {"amount_usd": amt},
                 "summary": f"Return ${amt} of excess margin (leaves 1.5x the required margin)"}, "Drafted a return of excess margin."
-    return None, "Only rebalance, top_up and return_excess can be drafted here."
+    return None, "Only rebalance, top_up and return_excess can be drafted here (an exposure update comes from propose_exposure_update)."

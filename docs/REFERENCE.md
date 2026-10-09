@@ -716,6 +716,15 @@ normal signed deploy with the draft's values. Needs `AGENT_ENABLED=true` and an 
 - **An existing strategy** (`context.strategy_id`, owner must match): answers from its state and can return `action_draft`
   `{type, params, summary}` for `rebalance` (`{target_size}`), `top_up` (`{amount_usd}`: whole dollars that bring equity to 2x
   maintenance margin) or `return_excess` (`{amount_usd}`: margin above 1.5x the requirement). Edit and close get a text answer only.
+  A fourth type, `update_exposure`, comes from the chat tool `propose_exposure_update(mode: "set" | "change", value_oz)`: the model only extracts what the manager
+  said ("set it to 0.07" -> set 0.07; "bought 0.02 more" -> change +0.02; "sold 0.01" -> change -0.01). **The server does the rest**: the number must literally be in the
+  manager's message; the words decide whether it is a total or a change and which way (no number, a bare number, "total or change?", both directions, or a sign that
+  contradicts the words is a clarifying question, never a draft); the server adds the change to the current exposure; a result at or below zero is refused; and the
+  same venue-minimum check the signed update would get is applied, so a draft is never one that would be refused. The draft is
+  `{type: "update_exposure", params: {exposure_oz}, summary, previous_exposure_oz, new_target_size, gap_pct}`; the summary reads "Update fund exposure from 0.05 oz to 0.07 oz
+  (target 0.07 oz). No trade; the agent proposes a rebalance on its next check." ("rebalances" when the agent holds an active grant on the strategy). Cantina renders an
+  action card with "Approve with passkey", signs `update_exposure {exposure_oz}` and calls `POST /strategies/{id}/exposure`: no other path. The endpoint moves the target only (no
+  trade), is attested, needs the owner (a delegate gets `DELEGATE_NOT_ALLOWED`), and applies the same minimum-order check as `PATCH`. Each chat mode dispatches only its own tools.
 - **Limits:** sessions last 24 h (`CHAT_SESSION_EXPIRED`), 30 user messages per session and 12 per minute per owner
   (`CHAT_LIMIT_REACHED`), 4,000 characters per message. If the model is unreachable or unconfigured the call fails with
   `LLM_UNAVAILABLE` and **nothing is stored** for that turn, so Cantina can fall back to the manual form.

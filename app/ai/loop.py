@@ -2,6 +2,7 @@
 money. One strategy's failure never stops the others."""
 import logging
 import threading
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import time
 
@@ -22,6 +23,7 @@ from .state import build_snapshot
 
 D = Decimal
 log = logging.getLogger("sereel.agent")
+FIRST_CYCLE_DELAY_S = 5  # do not make the first look wait a whole interval
 _lock = threading.Lock()
 _last_run_once: dict[str, float] = {}
 last_cycle: dict = {"at": None}
@@ -134,6 +136,7 @@ def run_once(sid: str) -> AgentDecision:
 
 def register(sched) -> None:
     if not settings.agent_enabled:
+        log.info("agent is OFF (AGENT_ENABLED=false): no cycles run and Jev is never called")
         return
 
     def tick():
@@ -142,5 +145,8 @@ def register(sched) -> None:
         except Exception:
             log.exception("agent cycle failed (will retry)")
 
-    sched.add_job(tick, "interval", seconds=max(10, settings.agent_interval_s), id="agent-cycle", max_instances=1, coalesce=True,
-                  misfire_grace_time=30)
+    every = max(10, settings.agent_interval_s)
+    log.info("agent is ON: a cycle runs every %ds for every active strategy (first one in %ds); Jev is asked on each, whether or not anything "
+             "is done. Log: %s", every, FIRST_CYCLE_DELAY_S, settings.agent_log_file or "console only")
+    sched.add_job(tick, "interval", seconds=every, id="agent-cycle", max_instances=1, coalesce=True, misfire_grace_time=30,
+                  next_run_time=datetime.now(timezone.utc) + timedelta(seconds=FIRST_CYCLE_DELAY_S))

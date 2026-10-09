@@ -52,7 +52,8 @@ def record(strategy_id: str, snap, sig, decision) -> None:
              "degraded": snap.degraded, "probabilities": probs, "decision": decision.kind, "action": decision.action, "reason": decision.reason,
              "downgraded_from": decision.downgraded_from}
     if jr is not None:
-        entry["jev"] = {"model": jr.model, "latency_ms": jr.latency_ms, "usage": jr.usage, "auth_header": jr.auth_header}
+        entry["jev"] = {"model": jr.model, "latency_ms": jr.latency_ms, "usage": jr.usage, "auth_header": jr.auth_header,
+                        "response": jr.raw}  # the full JSON Jev returned, as received
     if sig.jev_error:
         entry["jev_error"] = sig.jev_error  # why the rules answered instead
     if snap.absent:
@@ -60,6 +61,8 @@ def record(strategy_id: str, snap, sig, decision) -> None:
     if settings.agent_log_state:
         entry["state"] = snap.to_state_text()
     _append(entry)
+    if jr is not None:
+        log.info("agent %s jev response: %s", strategy_id[:8], json.dumps(jr.raw, separators=(",", ":"), sort_keys=True))
     log.info("agent %s signals (%s%s): %s -> %s%s (%s)", strategy_id[:8], sig.source, f", {jr.latency_ms}ms" if jr else f"; Jev: {sig.jev_error}",
              " ".join(f"{k}={v}" for k, v in probs.items()), decision.kind, f" {decision.action['type']}" if decision.action else "", decision.reason)
 

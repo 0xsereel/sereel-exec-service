@@ -59,9 +59,12 @@ public key (what an owner grants autopilot to). `sereel x402 buy <id> --keypair 
   top-ups, close and the data feed always need the owner.
 
 **AI agent and data feed**
-- **Watching the agent:** every 60 s cycle logs each Jev answer and the decision to the server log and to `logs/agent_signals.jsonl`
-  (rotates at 5 MB). Read it with `sereel agent log -n 20 [--strategy ID] [--follow] [--raw]`; `AGENT_LOG_STATE=true` also records the full
+- **Watching the agent:** Jev is asked on **every** cycle for every active strategy, whether or not anything is done (a quiet cycle is a
+  decision of `none`). Each cycle logs the full Jev JSON and the decision to the server log and to `logs/agent_signals.jsonl`
+  (rotates at 5 MB); startup prints `agent is ON ...` or `agent is OFF`; httpx and the 5 s scheduler lines are muted. Read it with `sereel agent log -n 20 [--strategy ID] [--follow] [--raw]`; `AGENT_LOG_STATE=true` also records the full
   text Jev was shown. The database keeps only the latest quiet cycle, so this file is the history.
+- **Exposure updates** (`POST /strategies/{id}/exposure`, owner-signed `update_exposure {exposure_oz}`) move the target only: no trade, the agent
+  rebalances (or proposes) on its next check. The chat can draft one ("bought 0.02 more"), but the server computes the new total, never the model.
 - The model never chooses a number that reaches the venue; it only explains. The chat validates every value on the server and the
   draft is checked by the same code that deploys it.
 - **Data feed:** off until the owner enables it. Payments settle straight to the customer (the service never holds them) in

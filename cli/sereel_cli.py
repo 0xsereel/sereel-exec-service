@@ -26,6 +26,10 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(x402_app, name="x402")
 console = Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+# Quiet the two chattiest libraries so the lines that matter (the agent's Jev answers, the watcher, the market maker) are not buried: httpx logs
+# every request (about 25 per agent cycle) and the scheduler logs every 5-second job. Their warnings and errors still show.
+for _noisy in ("httpx", "httpcore", "apscheduler.executors.default"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 FAUCET = "https://faucet.solana.com"
 
 

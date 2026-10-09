@@ -809,19 +809,27 @@ def require_order_viable(st: Strategy, target_signed: Decimal, mark: Decimal, wh
                                f"but the strategy holds {cash:.2f}; add margin with a top-up first. Nothing was sent")
 
 
-def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strategy:
-    """PATCH: change the hedge ratio and/or exposure. Moves the TARGET only; no order is sent (that is rebalance)."""
-    ratio, exposure = _parse_edit(params)
+def exposure_plan(st: Strategy, new_exposure: Decimal, ratio_bps: int | None = None) -> dict:
+    """What moving the fund exposure to `new_exposure` (and, optionally, the ratio) means for this strategy, and whether the rebalance it would
+    cause is one the venue accepts. Raises BAD_REQUEST (the same message PATCH gives) if it is not. Nothing is stored or sent."""
+    mark = venue().mark_price(st.market_id)
+    new_target = new_exposure * Decimal(ratio_bps if ratio_bps is not None else st.hedge_ratio_bps) / 10_000
+    held = abs(st.size)
+    gap_bps = int(abs(new_target - held) / new_target * 10_000) if new_target else 0
+    if gap_bps > st.rebalance_band_bps:  # a rebalance would have to trade: make sure it could
+        require_order_viable(st, -new_target, mark, "moving to this target", check_margin=False)  # margin: the owner tops up after the edit
+    gap_pct = (abs(new_target - held) / new_target * 100) if new_target else Decimal(0)
+    return {"mark": mark, "new_target_size": new_target, "held": held, "gap_bps": gap_bps, "gap_pct": gap_pct,
+            "outside_band": gap_bps > st.rebalance_band_bps}
+
+
+def _edit(sid: str, ratio: int | None, exposure: Decimal | None, params: dict, authorization, org: str, action: str) -> Strategy:
+    """The shared body of PATCH (edit_hedge_settings) and POST /exposure (update_exposure): moves the TARGET only; no order is sent."""
     st = get_strategy(sid, org)
     if st.status != S_ACTIVE:
         raise ServiceError("CONFLICT", f"strategy is {st.status}; settings can only be edited while it is active", 409)
-    mark = venue().mark_price(st.market_id)
-    new_target = (exposure if exposure is not None else st.target_exposure_units) * \
-        Decimal(ratio if ratio is not None else st.hedge_ratio_bps) / 10_000
-    gap_bps = int(abs(new_target + st.size) / new_target * 10_000) if new_target else 0  # st.size is negative for a short
-    if gap_bps > st.rebalance_band_bps:  # a rebalance would have to trade: make sure it could
-        require_order_viable(st, -new_target, mark, "moving to this target", check_margin=False)  # margin: the owner tops up after the edit
-    st, signer = authorize_action(sid, "edit_hedge_settings", authorization, params, org)
+    mark = exposure_plan(st, exposure if exposure is not None else st.target_exposure_units, ratio)["mark"]
+    st, signer = authorize_action(sid, action, authorization, params, org)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         before = {"hedge_ratio_bps": st.hedge_ratio_bps, "target_exposure_units": st.target_exposure_units,
@@ -837,16 +845,34 @@ def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strat
         after = {"hedge_ratio_bps": st.hedge_ratio_bps, "target_exposure_units": st.target_exposure_units,
                  "required_margin_usd": st.required_margin_usd}
         fund, size, target = st.fund_id, st.size, target_size(st)
-    record = {"event": "edit_hedge_settings", "from": before, "to": after, "target_size": target, "current_size": size,
+    record = {"event": action, "from": before, "to": after, "target_size": target, "current_size": size,
               "signed_by": signer, "authorization_nonce": (authorization or {}).get("nonce")}
-    asig = _record_action(sid, "edit_hedge_settings", record, fund, signed_by=signer, authorization=authorization)
+    asig = _record_action(sid, action, record, fund, signed_by=signer, authorization=authorization)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         st.last_attestation_sig = asig
         s.add(st)
         s.commit()
-    take_snapshot(sid, "edit_hedge_settings")
+    take_snapshot(sid, action)
     return get_strategy(sid, org)
+
+
+def edit_settings(sid: str, params: dict, authorization, org: str = "") -> Strategy:
+    """PATCH: change the hedge ratio and/or exposure. Moves the TARGET only; no order is sent (that is rebalance)."""
+    ratio, exposure = _parse_edit(params)
+    return _edit(sid, ratio, exposure, params, authorization, org, "edit_hedge_settings")
+
+
+def update_exposure(sid: str, params: dict, authorization, org: str = "") -> Strategy:
+    """POST /strategies/{id}/exposure: the owner signs `update_exposure {exposure_oz}`, the new TOTAL fund exposure in oz. Moves the target only; no
+    trade (the agent rebalances on its next check, or proposes it). The same checks as an edit: a target the venue could not trade is refused."""
+    try:
+        exposure = Decimal(params["exposure_oz"])
+    except (KeyError, ArithmeticError):
+        raise _bad("exposure_oz is required: the new total fund exposure in oz, as a decimal string")
+    if exposure <= 0:
+        raise _bad("exposure_oz must be positive")
+    return _edit(sid, None, exposure, params, authorization, org, "update_exposure")
 
 
 def hedge_gap(st: Strategy) -> tuple[Decimal, int]:
