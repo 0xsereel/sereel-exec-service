@@ -33,7 +33,8 @@ from .models import Strategy, UsedNonce, now
 
 log = logging.getLogger("sereel.auth")
 PREFIX, NETWORK = "sereel-strategy-v1", "solana"
-ACTIONS = ("return_excess", "close_strategy", "rebalance", "edit_hedge_settings", "change_owner", "dismiss_decision", "run_once")
+ACTIONS = ("return_excess", "close_strategy", "rebalance", "edit_hedge_settings", "change_owner", "dismiss_decision", "run_once",
+           "grant_delegate", "revoke_delegate")
 NONCE_TTL_S = 120  # anything older than the 60s age limit is already rejected; keep a margin
 
 
@@ -55,6 +56,11 @@ FIELD_TYPES = {
     "owner_multisig": "str",
     "decision_id": "str",
     "strategy_id": "str",
+    "delegate_pubkey": "str",
+    "allowed_actions": "str",
+    "max_rebalance_oz_per_day": "decimal",
+    "rebalance_within_band_only": "str",
+    "expires_at": "str",
 }
 
 
@@ -230,5 +236,17 @@ def authorize(authorization, action: str, st: Strategy, params: dict) -> str:
         log.warning("!!! DEV_AUTH_BYPASS is ON: skipping signed-message authorization for %s on strategy %s !!!", action, st.id)
         return "dev-bypass"
     verified = verify(authorization, action, st.id, params)
-    assert_signer_owns(st, verified.signer)
+    try:
+        assert_signer_owns(st, verified.signer)
+    except ServiceError:
+        # not the owner: a delegate may sign `rebalance` and nothing else, and only while its grant is active
+        from . import delegates
+
+        grant = delegates.latest(st.id, verified.signer)
+        if grant is None:
+            raise
+        if action != "rebalance":
+            raise ServiceError("DELEGATE_NOT_ALLOWED", f"a delegate may only sign `rebalance`, not `{action}`: that needs the owner's signature", 403)
+        if delegates.status(grant) != "active":
+            raise ServiceError("DELEGATE_NOT_ALLOWED", f"this delegate's grant is {delegates.status(grant)}: the owner must grant it again", 403)
     return verified.signer

@@ -13,7 +13,7 @@ from cli.sereel_cli import app
 D = Decimal
 runner = CliRunner()
 NAMES = {"funding": "funding_keypair", "attest": "attest_keypair",
-         "mint_authority": "mint_authority_keypair", "payment_source": "payment_source_keypair"}
+         "mint_authority": "mint_authority_keypair", "payment_source": "payment_source_keypair", "agent": "agent_keypair"}
 
 
 @pytest.fixture()
@@ -29,7 +29,7 @@ def pubkeys():
 
 def test_ensure_keys_creates_all_with_private_permissions(keys):
     assert set(setup.ensure_keys().values()) == {"created"}
-    assert len(list(keys.glob("*.json"))) == 4 and all(oct(p.stat().st_mode & 0o777) == "0o600" for p in keys.glob("*.json"))
+    assert len(list(keys.glob("*.json"))) == 5 and all(oct(p.stat().st_mode & 0o777) == "0o600" for p in keys.glob("*.json"))
 
 
 def test_existing_keys_are_never_overwritten_without_force(keys):

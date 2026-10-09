@@ -13,6 +13,7 @@ KEYS = {
     "attest": "attest_keypair",
     "mint_authority": "mint_authority_keypair",
     "payment_source": "payment_source_keypair",
+    "agent": "agent_keypair",  # signs delegated rebalances; holds nothing, so it is not in SOL_TARGETS
 }
 SOL_TARGETS = {"attest": Decimal("0.2"), "mint_authority": Decimal("0.2"), "payment_source": Decimal("0.2")}
 FUNDING_RESERVE = Decimal("0.3")  # the funding wallet keeps this for refund/withdrawal fees

@@ -176,3 +176,17 @@ def calibrate(market: str = typer.Option("XAU-HL", "--market")):
             console.print(f"[red]{sc}: {q} = {p} but must be {e} 0.5[/]")
         raise typer.Exit(1)
     console.print("[green]all answers point the right way[/]")
+
+
+@agent_app.command("key")
+def key():
+    """Print the agent's public key (what an owner grants a delegation to), creating the key if it does not exist. Never overwrites an
+    existing key and never prints the secret."""
+    from app import solana_client as sol
+
+    existed = sol.agent_kp() is not None
+    kp = sol.load_keypair(settings.agent_keypair, create=True)
+    console.print(f"agent key {'kept' if existed else 'created'}: {settings.resolve(settings.agent_keypair)}")
+    console.print(f"agent public key: [bold]{kp.pubkey()}[/]")
+    console.print("It signs rebalances only for strategies whose owner granted it a delegation. It holds no funds and needs no SOL.")
+    console.print("[yellow]Back up keys/ with the others.[/]")

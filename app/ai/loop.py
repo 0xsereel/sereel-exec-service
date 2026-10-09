@@ -2,6 +2,7 @@
 money. One strategy's failure never stops the others."""
 import logging
 import threading
+from decimal import Decimal
 import time
 
 from sqlmodel import Session, select
@@ -11,12 +12,15 @@ from ..db import engine
 from ..errors import ServiceError
 from ..models import S_ACTIVE, AgentDecision, Strategy, now
 from ..state import state
-from . import actions, decisions
-from .decide import decide
+from .. import delegates
+from ..strategies import service
+from . import actions, agent_key, decisions
+from .decide import Decision, decide
 from .explain import explain
 from .signals import get_signals
 from .state import build_snapshot
 
+D = Decimal
 log = logging.getLogger("sereel.agent")
 _lock = threading.Lock()
 _last_run_once: dict[str, float] = {}
@@ -29,6 +33,9 @@ def _last_executed_at(sid: str):
                                                      AgentDecision.decision == "execute").order_by(AgentDecision.at.desc())).first()
 
 
+OWNER_OUTCOMES = ("DELEGATE_LIMIT_EXCEEDED", "DELEGATE_NOT_ALLOWED", "AUTHORIZATION_INVALID", "AUTHORIZATION_REQUIRED")  # refused, not failed
+
+
 def run_strategy(sid: str) -> AgentDecision:
     """One full cycle for one strategy. Raises SIGNALS_UNAVAILABLE when there is not enough market data to decide on."""
     view = actions.strategy_view(sid)
@@ -37,14 +44,58 @@ def run_strategy(sid: str) -> AgentDecision:
     if "price" not in snap.sections and "venue" not in snap.sections:
         raise ServiceError("SIGNALS_UNAVAILABLE", "neither Pyth nor Hyperliquid could be read, so no decision was taken this cycle", 503)
     sig = get_signals(snap)
-    d = decide(snap, view, sig.probabilities, delegated=decisions.has_active_delegate(sid), now=now(), last_executed_at=_last_executed_at(sid))
+    delegated = decisions.has_active_delegate(sid)
+    d = decide(snap, view, sig.probabilities, delegated=delegated, now=now(), last_executed_at=_last_executed_at(sid))
+    if d.kind == "execute":
+        d = _within_the_grant(sid, d, view)  # the grant's limits, checked before anything is signed
     explanation = explain(d, view, snap, sig.probabilities)
     row = decisions.store(sid, state_hash=snap.state_hash, signals_source=sig.source, signals_network=snap.signals_network,
                           question_set_version=sig.question_set_version,
                           signals={k: f"{v:.2f}" for k, v in sorted(sig.probabilities.items())},
                           decision=d.kind, action=d.action, explanation=explanation, reason=d.reason, downgraded_from=d.downgraded_from)
     log.info("agent %s: %s%s (%s, signals %s)", sid[:8], d.kind, f" {d.action['type']}" if d.action else "", d.reason, sig.source)
+    if d.kind == "execute":
+        row = _execute(sid, row, snap, sig)
     return row
+
+
+def _within_the_grant(sid: str, d: Decision, view: dict) -> Decision:
+    """execute -> propose if this rebalance would break the owner's signed limits (the server enforces them again on the request)."""
+    grant = delegates.active_grant(sid, agent_key.pubkey())
+    gap = abs(D(str(view.get("hedge_gap_units") or 0)))
+    try:
+        if grant is None:
+            raise ServiceError("DELEGATE_NOT_ALLOWED", "the agent has no active grant on this strategy", 403)
+        delegates.check_rebalance(grant, sid, False, gap)
+        return d
+    except ServiceError as e:
+        return Decision("propose", d.action, f"{d.reason}; downgraded to a proposal: {e.message}", "execute")
+
+
+def _execute(sid: str, row: AgentDecision, snap, sig) -> AgentDecision:
+    """Sign a rebalance with the agent's key and send it through the normal service path (locks, nonce replay, limits, attestation)."""
+    meta = {"decision_id": row.id, "state_hash": snap.state_hash, "signals_source": sig.source, "question_set_version": sig.question_set_version,
+            "model": sig.jev_result.model if sig.jev_result else "rules", "signals": {k: f"{v:.2f}" for k, v in sorted(sig.probabilities.items())},
+            "trigger": {"sr": f"{sig.probabilities['should_rebalance']:.2f}", "ls": f"{sig.probabilities.get('liquidity_sufficient', D(0)):.2f}"}}
+    try:
+        authorization = agent_key.sign_authorization("rebalance", sid, {})
+        service.rebalance(sid, authorization, False, "", agent_meta=meta)
+    except ServiceError as e:
+        decisions.finish(row.id, "rejected" if e.code in OWNER_OUTCOMES else "failed", reason_note=f"execution refused: {e.code}: {e.message}")
+        log.warning("agent rebalance on %s did not run: %s %s", sid[:8], e.code, e.message)
+        return decisions.get(row.id)
+    except Exception as e:
+        decisions.finish(row.id, "failed", reason_note=f"execution error: {type(e).__name__}")
+        log.exception("agent rebalance on %s crashed", sid[:8])
+        return decisions.get(row.id)
+    act = decisions.latest_action(sid, "rebalance")
+    traded = bool(act and (act.record or {}).get("traded"))
+    if not traded:  # the gap closed or fell inside the band between the decision and the order
+        decisions.finish(row.id, "failed", reason_note="nothing traded: the hedge was already at target by the time the order was sent",
+                         action_id=act.id if act else None)
+    else:
+        decisions.finish(row.id, "executed", action_id=act.id, attestation_sig=act.attestation_sig)
+    return decisions.get(row.id)
 
 
 def run_cycle() -> int:

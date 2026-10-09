@@ -39,6 +39,8 @@ CODES: dict[str, tuple[int, str]] = {
     "PAYMENT_FAILED": (502, "the Solana payout failed"),
     # --- AI agent ---
     "SIGNALS_UNAVAILABLE": (503, "the agent could not read enough market data (neither Pyth nor Hyperliquid) to take a decision this cycle"),
+    "DELEGATE_LIMIT_EXCEEDED": (403, "a delegate's rebalance would exceed the limits the owner signed (daily size, or a forced rebalance on a band-only grant)"),
+    "DELEGATE_NOT_ALLOWED": (403, "the signer is a delegate but this action is not allowed for delegates (only rebalance is), or its grant has expired or been revoked"),
     "AGENT_DISABLED": (503, "the AI agent is switched off (AGENT_ENABLED=false)"),
     "LLM_UNAVAILABLE": (503, "the language model could not be reached or is not configured; the chat cannot respond (use the manual form)"),
     "CHAT_SESSION_EXPIRED": (410, "the chat session is older than 24 hours; start a new one"),

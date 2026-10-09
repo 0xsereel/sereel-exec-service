@@ -24,6 +24,7 @@ from ..state import state
 from ..util import iso, num
 from ..venue.base import DEFAULT_SLIPPAGE, account_lock
 from . import attest as att
+from .. import delegates
 from ..ai import decisions
 
 log = logging.getLogger("sereel.strategies")
@@ -446,9 +447,9 @@ def reconcile() -> dict:
 
 def _record_action(strategy_id: str, action: str, record: dict, fund_id: str, solana_signature: str | None = None,
                    hl_order_ids: list | None = None, signed_by: str | None = None, authorization: dict | None = None,
-                   attest: bool = True) -> str | None:
+                   attest: bool = True, memo_extra: dict | None = None) -> str | None:
     """Store the full record and (unless attest=False) attest its hash on Solana. Returns the attestation signature."""
-    sig = att.attest(strategy_id, fund_id, action, record) if attest else None
+    sig = att.attest(strategy_id, fund_id, action, record, memo_extra) if attest else None
     with Session(engine) as s:
         s.add(Action(strategy_id=strategy_id, action=action, record=att.jsonable(record), solana_signature=solana_signature,
                      hl_order_ids=hl_order_ids or [], attestation_sig=sig, signer_public_key=signed_by,
@@ -857,7 +858,7 @@ def hedge_gap(st: Strategy) -> tuple[Decimal, int]:
     return gap, int(abs(gap) / target * 10_000)
 
 
-def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> Strategy:
+def rebalance(sid: str, authorization, force: bool = False, org: str = "", agent_meta: dict | None = None) -> Strategy:
     """Move the hedge to its target if the gap is beyond the strategy's rebalance band (or `force`). Shrinking is
     reduce-only; growing needs the strategy's own capital to cover the new size at its leverage."""
     st = get_strategy(sid, org)
@@ -871,6 +872,7 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
         require_order_viable(st, -target_size(st), v0.mark_price(st.market_id), "this rebalance")
         require_liquidity(st.market_id, delta0 > 0, abs(delta0), "this rebalance")
     st, signer = authorize_action(sid, "rebalance", authorization, {}, org)
+    grant = delegates.grant_for_signer(sid, signer)  # None for the owner; a delegate acts within its signed limits
     v = venue()
     nonce = (authorization or {}).get("nonce")
     with account_lock(v.account_key):
@@ -899,6 +901,8 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
                 if ledger_drift(s, st.market_id):
                     raise ServiceError("CONFLICT", "the venue position differs from the ledger; rebalancing is held until it is reconciled", 409)
                 require_liquidity(st.market_id, (target_signed - st.size) > 0, abs(target_signed - st.size), "this rebalance")  # again, now
+                if grant is not None:  # a delegate's limits are enforced here, on every request, from what the owner signed
+                    delegates.check_rebalance(grant, sid, force, abs(target_signed - st.size))
                 st.status = S_REBALANCING
                 s.add(st)
                 s.commit()
@@ -929,8 +933,19 @@ def rebalance(sid: str, authorization, force: bool = False, org: str = "") -> St
                       "realized_pnl_usd": realized, "size_after": st.size, "entry_px_after": st.entry_px, "hl_oids": fill.oids,
                       "reduce_only": [p.reduce_only for p in fill.partials], "signed_by": signer, "authorization_nonce": nonce,
                       "market_closed": v.market_closed.get(market_id, False)}
+            if grant is not None:
+                record["signed_by_role"] = "delegate"
+                record["delegate_grant"] = {"max_rebalance_oz_per_day": grant.max_rebalance_oz_per_day, "expires_at": delegates.iso(grant.expires_at),
+                                            "rebalance_within_band_only": grant.rebalance_within_band_only}
+            if agent_meta:
+                record["agent"] = agent_meta  # the state hash, every probability, the model ids and the decision id: the memo's hash commits to them
             oids = list(fill.oids)
-    asig = _record_action(sid, "rebalance", record, fund, hl_order_ids=oids, signed_by=signer, authorization=authorization)
+    memo_extra = None
+    if grant is not None:
+        memo_extra = {"by": "delegate"}
+        if agent_meta:  # compact: the state hash, the probabilities that triggered the action, the question set and the Jev model
+            memo_extra.update({"sh": agent_meta["state_hash"], "p": agent_meta["trigger"], "q": agent_meta["question_set_version"], "m": agent_meta["model"]})
+    asig = _record_action(sid, "rebalance", record, fund, hl_order_ids=oids, signed_by=signer, authorization=authorization, memo_extra=memo_extra)
     with Session(engine) as s:
         st = s.get(Strategy, sid)
         st.last_attestation_sig = asig

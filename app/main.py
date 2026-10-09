@@ -104,6 +104,12 @@ def health():
            "hyperliquid": {"network": "testnet" if settings.is_hl_testnet else "mainnet"},
            "solana": {"network": "devnet" if sol.is_devnet() else "other"},
            "stablecoin_mint": settings.stablecoin_mint or None}
+    from .ai import agent_key
+
+    try:
+        out["agent_pubkey"] = agent_key.pubkey()  # what an owner grants a delegation to; null until the key exists
+    except Exception:
+        out["agent_pubkey"] = None
     try:
         out["funding_address"] = str(sol.funding_kp().pubkey())
     except FileNotFoundError:

@@ -35,6 +35,14 @@ _REAL_ENSURE_CURSOR = _watcher.ensure_cursor
 
 
 @pytest.fixture(autouse=True)
+def agent_key_in_tmp(tmp_path, monkeypatch):
+    """No test may touch the real keys/ directory: the agent key lives in a per-test temporary path (absent until a test creates it)."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "agent_keypair", str(tmp_path / "agent-key" / "agent.json"))
+
+
+@pytest.fixture(autouse=True)
 def no_devnet_at_startup(monkeypatch):
     """The API's startup takes the deposit watcher's baseline from devnet. Tests must never touch devnet, so it is a no-op unless
     a test uses the fake chain (which supplies a fake RPC and switches the real baseline back on)."""

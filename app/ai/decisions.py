@@ -30,6 +30,17 @@ def out(d: AgentDecision) -> dict:
             "outcome": d.outcome, "action_id": d.action_id, "attestation_sig": d.attestation_sig}
 
 
+def get(decision_id: str) -> AgentDecision:
+    with Session(engine) as s:
+        return s.get(AgentDecision, decision_id)
+
+
+def latest_action(strategy_id: str, name: str) -> Action | None:
+    with Session(engine) as s:
+        return s.exec(select(Action).where(Action.strategy_id == strategy_id, Action.action == name)
+                      .order_by(Action.created_at.desc(), Action.id)).first()
+
+
 def latest(strategy_id: str) -> AgentDecision | None:
     with Session(engine) as s:
         return s.exec(select(AgentDecision).where(AgentDecision.strategy_id == strategy_id)
@@ -55,7 +66,15 @@ def has_unread_proposal(strategy_id: str) -> bool:
 
 
 def has_active_delegate(strategy_id: str) -> bool:
-    return False  # replaced by the delegates table in the delegation step
+    """True when the AGENT's own key holds an active grant on this strategy (a grant to someone else does not make the service autopilot)."""
+    from .. import delegates
+    from . import agent_key
+
+    try:
+        pub = agent_key.pubkey()
+    except Exception:
+        return False
+    return pub is not None and delegates.active_grant(strategy_id, pub) is not None
 
 
 def agent_mode(strategy_id: str) -> str | None:
@@ -91,6 +110,17 @@ def store(strategy_id: str, *, state_hash: str, signals_source: str, signals_net
         s.commit()
         s.refresh(row)
         return row
+
+
+def finish(decision_id: str, outcome: str, *, reason_note: str | None = None, action_id: str | None = None, attestation_sig: str | None = None) -> None:
+    """Record how an `execute` decision ended."""
+    with Session(engine) as s:
+        d = s.get(AgentDecision, decision_id)
+        d.outcome, d.action_id, d.attestation_sig = outcome, action_id, attestation_sig
+        if reason_note:
+            d.reason = f"{d.reason}; {reason_note}"
+        s.add(d)
+        s.commit()
 
 
 def dismiss_lookup(strategy_id: str, decision_id: str) -> AgentDecision | None:

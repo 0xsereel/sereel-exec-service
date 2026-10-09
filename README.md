@@ -573,6 +573,8 @@ Cantina handles the first four specially, so their spelling is fixed.
 | `WITHDRAW_FAILED` | 400 | the bridge rejected the withdrawal |
 | `PAYMENT_FAILED` | 502 | the Solana payout failed |
 | `SIGNALS_UNAVAILABLE` | 503 | the agent could not read enough market data (neither Pyth nor Hyperliquid) to take a decision this cycle |
+| `DELEGATE_LIMIT_EXCEEDED` | 403 | a delegate's rebalance would exceed the limits the owner signed (daily size, or a forced rebalance on a band-only grant) |
+| `DELEGATE_NOT_ALLOWED` | 403 | the signer is a delegate but this action is not allowed for delegates (only rebalance is), or its grant has expired or been revoked |
 | `AGENT_DISABLED` | 503 | the AI agent is switched off (AGENT_ENABLED=false) |
 | `LLM_UNAVAILABLE` | 503 | the language model could not be reached or is not configured; the chat cannot respond (use the manual form) |
 | `CHAT_SESSION_EXPIRED` | 410 | the chat session is older than 24 hours; start a new one |
@@ -721,4 +723,46 @@ there is no extra call. `GET /strategies` rows gain `agent_mode` (`monitoring` w
 once a delegate grant exists) and `has_unread_proposal` (a suggestion or proposal is waiting).
 
 `SIGNALS_UNAVAILABLE` (503) is returned by `run_once` when neither Pyth nor Hyperliquid could be read.
+
+## AI agent (Step 4: delegation and the autonomous rebalance)
+
+An owner can let the agent rebalance a strategy on its own, within limits the owner signs. Nothing else is ever delegated.
+
+**What a delegate can do: sign `rebalance`, and only that.** A rebalance carries no parameters, so a delegate cannot choose a target:
+it moves the hedge toward the strategy's own target. Every other signed action (return excess, close, edit, change owner, grant, revoke,
+dismiss, run-once, and later the data feed and NAV publishing) needs the **owner's** signature; a delegate attempting one gets
+`DELEGATE_NOT_ALLOWED` (403) and nothing happens. Top-ups move money from the owner's wallet, so the agent cannot make them. A key with
+no grant at all is just "not the owner" (`AUTHORIZATION_INVALID`), exactly as before. The delegate's request goes through the same
+verification, replay protection and per-account locks as the owner's.
+
+**The agent key** is `keys/agent.json` (`AGENT_KEYPAIR`), created by `sereel init` or `sereel agent key`. It only signs messages: it holds
+no funds and needs no SOL, is never overwritten, and its public key (what to grant a delegation to) is `agent_pubkey` in `/health` and
+`/agent/status`.
+
+**Grant** (owner-signed `grant_delegate`): `POST /strategies/{id}/delegates` with flat string fields `delegate_pubkey`,
+`allowed_actions` (exactly `"rebalance"`), `max_rebalance_oz_per_day` (decimal), `rebalance_within_band_only` (`"true"`/`"false"`) and
+`expires_at` (ISO 8601 UTC such as `"2026-10-15T09:00:00Z"`, in the future and at most 30 days out; Cantina defaults to now + 7 days),
+plus `authorization`. A bad grant is refused before the owner's signature is spent. A new grant to the same key replaces the old one
+(kept as revoked history). **Revoke** (`revoke_delegate`): `DELETE /strategies/{id}/delegates/{pubkey}` with `{authorization}`; it takes
+effect at once. Both are attested. `GET /strategies/{id}/delegates` lists every grant with `status` active, expired or revoked; the two
+limits are echoed **exactly as signed, as strings** (`"0.5"`, `"true"`), the one exception to JSON booleans.
+
+**Limits, enforced on the server on every delegate request** (`DELEGATE_LIMIT_EXCEEDED`, 403, nothing traded):
+- `max_rebalance_oz_per_day`: the total oz this delegate moved on the strategy in the last 24 hours, plus this rebalance, must not
+  exceed it (exactly equal is allowed). The owner's own rebalances do not count.
+- `rebalance_within_band_only`: with `"true"` the delegate may only do a normal rebalance (the hedge is outside the strategy's band);
+  a **forced** rebalance (`?force=true`, which trades inside the band) needs the owner. With `"false"` force is allowed.
+- Expired or revoked: `DELEGATE_NOT_ALLOWED`.
+
+**Autopilot.** When the agent's own key holds an active grant on a strategy (`agent_mode: "autopilot"`), a confident rebalance decision is
+`execute`: the loop signs a rebalance with the agent key and sends it through the normal path. Money movements (top-up, return excess) and
+holds are never executed. An `execute` becomes a `propose` (with `downgraded_from: "execute"` and the reason) when the grant's limits
+would be exceeded, when the execution testnet is more than 50 bps from Pyth, or when an action was already executed in the last 10
+minutes. If the order is refused by the server's limits the decision ends `rejected`; any other failure (no liquidity, margin, not
+filled) ends `failed`, with the reason; a trade that did happen ends `executed`, linking the action and its attestation.
+
+**Attestation.** The rebalance's Solana memo carries `by: "delegate"`, `sh` (the state hash the agent saw), `p` (the probabilities that
+triggered it: `sr` = should_rebalance, `ls` = liquidity_sufficient), `q` (the question-set version) and `m` (the Jev model id). The full
+record, including every probability, the decision id and the delegate's grant limits, is stored with the action and its hash `h` is
+in the memo, so the evidence is committed on-chain.
 

@@ -10,7 +10,9 @@ from ..config import settings
 from ..deps import auth
 from ..errors import ServiceError
 from ..strategies import service
-from . import chat, decisions, loop
+from .. import delegates
+from ..strategies import service as _svc  # noqa: F401
+from . import agent_key, chat, decisions, loop
 
 router = APIRouter(prefix="/agent", dependencies=auth)
 
@@ -160,7 +162,7 @@ def status():
     return {"enabled": settings.agent_enabled, "signals_network": settings.signals_source_network,
             "execution_network": "testnet" if settings.is_hl_testnet else "mainnet", "interval_s": settings.agent_interval_s,
             "last_cycle_at": decisions.iso(last), "jev_model": settings.jev_model if settings.jev_api_key else None,
-            "llm_model": settings.llm_model if settings.llm_api_key else None, "agent_pubkey": None}
+            "llm_model": settings.llm_model if settings.llm_api_key else None, "agent_pubkey": agent_key.pubkey()}
 
 
 async def _signed(request: Request) -> tuple[dict, dict | None]:
@@ -218,3 +220,54 @@ async def dismiss(sid: str, did: str, request: Request):
         raise ServiceError("NOT_FOUND", "decision not found", 404)
     service.authorize_action(sid, "dismiss_decision", authorization, params)
     return decisions.out(decisions.dismiss(sid, did))
+
+
+# ---- delegation ------------------------------------------------------------------------------------------------------------------------
+
+@strategy_router.get("/{sid}/delegates")
+def list_delegates(sid: str):
+    service.get_strategy(sid)
+    return [delegates.out(g) for g in delegates.list_for(sid)]
+
+
+@strategy_router.post("/{sid}/delegates")
+async def grant_delegate(sid: str, request: Request):
+    """Owner-signed (`grant_delegate`): let a key sign `rebalance` on this strategy within the signed limits. Flat string body fields:
+    delegate_pubkey, allowed_actions ("rebalance"), max_rebalance_oz_per_day, rebalance_within_band_only ("true"|"false"), expires_at
+    (ISO 8601 UTC, in the future, at most 30 days out)."""
+    body, authorization = await _signed(request)
+    params = {k: body[k] for k in delegates.GRANT_FIELDS if k in body}
+    from .. import auth as authmod
+
+    authmod.validate_params(params)
+    st = service.get_strategy(sid)
+    if st.status != "active":
+        raise ServiceError("CONFLICT", f"strategy is {st.status}; a delegate can only be granted on an active strategy", 409)
+    pub, max_oz, band_only, expires = delegates.parse_grant(params, st.owner_pubkey)  # a bad grant never burns the owner's nonce
+    st, signer = service.authorize_action(sid, "grant_delegate", authorization, params)
+    g = delegates.create(sid, pub, params["max_rebalance_oz_per_day"], params["rebalance_within_band_only"], expires, signer)
+    record = {"event": "grant_delegate", **params, "signed_by": signer, "authorization_nonce": (authorization or {}).get("nonce"), "grant_id": g.id}
+    asig = service._record_action(sid, "grant_delegate", record, st.fund_id, signed_by=signer, authorization=authorization)
+    delegates.set_attestation(g.id, asig)
+    return delegates.out(delegates.latest(sid, pub))
+
+
+@strategy_router.delete("/{sid}/delegates/{pubkey}")
+async def revoke_delegate(sid: str, pubkey: str, request: Request):
+    """Owner-signed (`revoke_delegate`, params {delegate_pubkey}). Takes effect at once: the next request signed by that key is refused."""
+    _, authorization = await _signed(request)
+    params = {"delegate_pubkey": pubkey}
+    from .. import auth as authmod
+
+    authmod.validate_params(params)
+    service.get_strategy(sid)
+    g = delegates.active_grant(sid, pubkey)
+    if g is None:
+        raise ServiceError("NOT_FOUND", "no active grant for that key on this strategy", 404)
+    st, signer = service.authorize_action(sid, "revoke_delegate", authorization, params)
+    g = delegates.revoke(g.id)
+    record = {"event": "revoke_delegate", "delegate_pubkey": pubkey, "grant_id": g.id, "signed_by": signer,
+              "authorization_nonce": (authorization or {}).get("nonce")}
+    asig = service._record_action(sid, "revoke_delegate", record, st.fund_id, signed_by=signer, authorization=authorization)
+    delegates.set_attestation(g.id, asig, revoke=True)
+    return delegates.out(delegates.latest(sid, pubkey))

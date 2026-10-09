@@ -192,6 +192,23 @@ class AgentDecision(SQLModel, table=True):
     attestation_sig: str | None = None
 
 
+class Delegate(SQLModel, table=True):
+    """An owner-signed grant letting `delegate_pubkey` sign `rebalance` (and nothing else) on one strategy, within limits. The limits
+    are kept exactly as signed (strings) so the API can echo them back unchanged. Rows are history: a revoked or replaced grant stays."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    strategy_id: str = Field(index=True)
+    delegate_pubkey: str = Field(index=True)
+    allowed_actions: str = "rebalance"
+    max_rebalance_oz_per_day: str  # as signed, e.g. "0.5"
+    rebalance_within_band_only: str  # as signed: "true" | "false"
+    expires_at: datetime
+    granted_at: datetime = Field(default_factory=now)
+    granted_by: str = ""  # the owner's signing key
+    revoked_at: datetime | None = None
+    attestation_sig: str | None = None
+    revoke_attestation_sig: str | None = None
+
+
 class Withdrawal(SQLModel, table=True):
     """Return-excess and close share this state machine."""
     id: str = Field(default_factory=new_id, primary_key=True)

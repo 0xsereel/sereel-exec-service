@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     funding_keypair: str = "./keys/funding.json"
     attest_keypair: str = "./keys/attest.json"
     payment_source_keypair: str = "./keys/payment_source.json"
+    agent_keypair: str = "./keys/agent.json"  # signs the agent's rebalances as a delegate; holds no funds and needs no SOL
 
     hl_connect_timeout_s: float = 60  # while connecting only: the one-off metadata downloads are large and Hyperliquid can be slow
     hl_connect_attempts: int = 4  # a failed connect step is retried (with a growing pause) before giving up
