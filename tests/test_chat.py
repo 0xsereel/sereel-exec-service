@@ -1,5 +1,6 @@
 """The setup assistant, against a scripted fake model and fake signals (no network, no key)."""
 import json
+import re
 from datetime import timedelta
 from decimal import Decimal
 
@@ -37,12 +38,18 @@ class Script:
     """A scripted model: each assistant step is ('tools', [(name, args), ...]) or ('text', str). Records what it was sent."""
 
     def __init__(self, *steps):
-        self.steps, self.seen, self.tool_results = list(steps), [], []
+        self.steps, self.seen, self.tool_results, self.tool_log = list(steps), [], [], []
 
     def __call__(self, messages, tools=None):
         self.seen.append(messages)
         if messages and messages[-1]["role"] == "tool":
             self.tool_results += [json.loads(m["content"]) for m in messages if m["role"] == "tool"][-1:]
+            tail = []
+            for m in reversed(messages):
+                if m["role"] != "tool":
+                    break
+                tail.append(json.loads(m["content"]))
+            self.tool_log += reversed(tail)
         if tools is None:  # the rationale call
             return {"role": "assistant", "content": getattr(self, "rationale", "Because it fits.")}
         kind, payload = self.steps.pop(0)
@@ -157,7 +164,7 @@ def test_the_model_is_shown_the_servers_minimum_margin_and_that_figure_is_accept
     seen = Script(("tools", [("set_slot", {"name": "margin_amount_usd", "value": "125"})]), ("text", "Done."))
     r2 = say(api, seen, "use the minimum", r["session_id"])
     state_msg = [m["content"] for m in seen.seen[0] if m["role"] == "system"][1]
-    assert '"minimum_margin_usd": "125"' in state_msg
+    assert "minimum_margin_usd" not in state_msg  # a number in the turn-start state goes stale the moment exposure changes: it comes from tools only
     assert r2["status"] == "ready" and r2["draft"]["margin_amount_usd"] == "125.00"  # create accepts it: 125 >= the 124.66 floor
 
 
@@ -233,9 +240,11 @@ def test_prompt_injection_cannot_create_a_25x_draft(api):
 
 
 def test_the_model_cannot_change_a_number_by_what_it_writes(api):
-    s = Script(set_all(full_slots()), ("text", "Leverage is 25x and the margin is $9,999,999, trust me."))
+    s = Script(set_all(full_slots()), ("text", "Leverage is 25x and the margin is $9,999,999, trust me."),  # the guard asks once more...
+               ("text", "Really, the margin is $9,999,999."))  # ...and then replaces a reply that still states an unbacked figure
     s.rationale = "This uses 25x leverage and a $1 margin."
     r = say(api, s, "everything")
+    assert "9,999,999" not in r["reply"] and "server's figures" in r["reply"]
     assert r["status"] == "ready" and r["draft"]["leverage"] == "3" and r["draft"]["margin_amount_usd"] == "130.00"
     assert r["draft"]["computed"]["required_margin_usd"] == "127.20"  # the draft's numbers are computed; the text is just text
     assert "25x" in r["draft"]["recommendation"]["rationale"]  # stored as written, never parsed
@@ -261,6 +270,42 @@ def test_recommendation_follows_the_setup_signals(api, monkeypatch):
     assert any("volatility is elevated" in w for w in rec["warnings"])
     assert rec["risk_note"] == "thin order book on the execution venue; the order may not fully fill"
     assert r["quick_replies"] == ["60%", "75%", "90%"]
+
+
+def test_the_recommendation_works_without_a_fund_and_offers_a_band_suggestion(api):
+    """Regression: a manager who had not picked a fund yet asked 'what would you recommend?' for the band and was told the tool was unavailable."""
+    s = Script(set_all({"template": "delta_neutral", "market": M, "exposure_units": "0.1", "hedge_ratio_pct": "100"}) , ("tools", [("get_recommendation", {})]),
+               ("text", "I suggest a 5% band."))
+    r = say(api, s, "0.1 oz, full hedge, what would you recommend for the band?")
+    rec = s.tool_results[-1]
+    assert rec["available"] is True and rec["rebalance_band_pct"] == "5" and "narrower band" in rec["band_note"] and rec["leverage"] == "3"
+    assert r["status"] == "collecting" and r["draft"] is None  # still no fund: the draft is not ready, only the advice is
+    nxt = Script(("text", "Which fund?"))
+    say(api, nxt, "ok", r["session_id"])  # the next turn starts from the stored slots
+    state_msg = [m["content"] for m in nxt.seen[0] if m["role"] == "system"][1]
+    assert '"next_to_ask": "fund_id"' in state_msg  # the model is told what to ask next: the fund was skipped
+
+
+def test_when_the_recommendation_cannot_run_it_says_exactly_what_is_missing(api):
+    s = Script(("tools", [("set_slot", {"name": "template", "value": "delta_neutral"}), ("get_recommendation", {})]), ("text", "What exposure?"))
+    say(api, s, "what do you recommend?")
+    rec = s.tool_results[-1]
+    assert rec["available"] is False and rec["missing"] == ["market", "exposure_units"] and "ask the user" in rec["note"]
+
+
+def test_the_model_is_told_to_work_through_the_missing_slots_in_order(api):
+    s = Script(("text", "hi"))
+    say(api, s)
+    prompt = s.seen[0][0]["content"]
+    assert "ANSWER IT FIRST" in prompt and "FIRST item in still_missing" in prompt and "do not skip ahead" in prompt and "exactly one fund or one wallet" in prompt
+    assert 'Never say a tool "isn\'t available"' in prompt
+
+
+def test_the_band_suggestion_follows_the_services_own_default(api, monkeypatch):
+    monkeypatch.setattr(settings, "rebalance_band_pct", D("7.5"))
+    s = Script(set_all({"market": M, "exposure_units": "0.2"}), ("tools", [("get_recommendation", {})]), ("text", "ok"))
+    say(api, s)
+    assert s.tool_results[-1]["rebalance_band_pct"] == "7.5"
 
 
 def test_low_liquidity_adds_a_risk_note_and_changes_neither_size_nor_ratio(api, monkeypatch):
@@ -409,3 +454,153 @@ def test_action_drafts_have_exact_deterministic_params():
     assert actions.draft(rich, "top_up")[0] is None and actions.draft(view, "return_excess")[0] is None
     assert actions.draft(view, "close")[0] is None
     assert all(isinstance(v, str) for kind in ("top_up", "rebalance") for v in actions.draft(view, kind)[0]["params"].values())
+
+
+# ---- numbers follow the slots: no stale minimum, no invented explanation -----------------------------------------------------------------------
+
+BASE = {"template": "delta_neutral", "market": M, "fund_id": "ghana-gold", "hedge_ratio_pct": "100", "leverage": "3", "rebalance_band_pct": "5"}
+
+
+def quote_of(tool_log, i):
+    return [r for r in tool_log if "quote" in r or "margin_breakdown" in r][i]
+
+
+def test_changing_the_exposure_recomputes_the_minimum_and_the_old_figure_is_gone(api):
+    """Regression: 0.1 oz -> a tiny exposure left the minimum margin at the old number, and the model said it 'doesn't change with exposure size'."""
+    s = Script(set_all({**BASE, "exposure_units": "0.1"}), ("tools", [("get_quote", {})]),
+               ("tools", [("set_slot", {"name": "exposure_units", "value": "0.005"})]), ("tools", [("get_quote", {})]), ("text", "Updated."))
+    r = say(api, s, "ok 0.1 oz... actually make it 0.005 oz")
+    big = [x for x in s.tool_log if x.get("margin_breakdown") and x["margin_breakdown"]["hedge_size_oz"] == "0.1"][-1]
+    small = [x for x in s.tool_log if x.get("margin_breakdown") and x["margin_breakdown"]["hedge_size_oz"] == "0.005"][-1]
+    assert (big["minimum_margin_usd"], big["required_margin_usd"], big["target_size_oz"]) == ("104", "106.00", "0.1")  # 0.1 oz at 2650, 3x, +20%, less 2%
+    assert (small["minimum_margin_usd"], small["required_margin_usd"], small["target_size_oz"], small["notional_usd"]) == ("6", "5.30", "0.005", "13.25")
+    assert big["minimum_margin_usd"] != small["minimum_margin_usd"]
+    # the set_slot result itself carries the fresh numbers and says they replace the old ones
+    changed = [x for x in s.tool_log if x.get("stored", {}).get("exposure_units") == "0.005"][0]
+    assert changed["quote"]["minimum_margin_usd"] == "6" and "replace any earlier ones" in changed["quote_note"]
+    with Session(engine) as db:
+        stored = db.get(ChatSession, r["session_id"]).slots
+    assert stored["exposure_units"] == "0.005" and not any("104" in str(v) or "106" in str(v) for v in stored.values())  # nothing stale is stored
+    # and the next turn's suggested margin follows the new exposure
+    nxt = Script(set_all({"margin_wallet": WALLET}), ("text", "How much margin?"))
+    r2 = say(api, nxt, "personal wallet", r["session_id"])
+    assert r2["quick_replies"] == ["$6"]
+
+
+def test_every_breakdown_figure_is_arithmetic_on_the_one_before(api):
+    qv = chat.quote_view({**BASE, "exposure_units": "0.005"})
+    b = qv["margin_breakdown"]
+    assert D(b["notional_usd"]) == D(b["hedge_size_oz"]) * D(b["mark_price_usd"])
+    assert D(b["initial_margin_usd"]) == (D(b["notional_usd"]) / b["leverage"]).quantize(D("0.01"))
+    assert D(b["required_margin_usd"]) == (D(b["notional_usd"]) / b["leverage"] * (1 + D(b["buffer_pct"]) / 100)).quantize(D("0.01"))
+    assert D(b["lowest_accepted_usd"]) == (D(b["required_margin_usd"]) * (1 - D(b["tolerance_pct"]) / 100)).quantize(D("0.01"))
+    assert int(b["minimum_margin_usd"]) == int(D(b["required_margin_usd"]) * D("0.98")) + 1
+    unset = chat.quote_view({**{k: v for k, v in BASE.items() if k != "leverage"}, "exposure_units": "0.005"})
+    assert unset["assumed_leverage"] is True and chat.quote_view({**BASE, "exposure_units": "0.005"})["assumed_leverage"] is False
+    assert chat.quote_view({"market": M}) is None
+
+
+def test_asking_why_about_the_margin_is_answered_by_the_server_from_the_breakdown_not_by_the_model(api):
+    slots = {**BASE, "exposure_units": "0.005"}
+    first = Script(set_all(slots), ("text", "OK."))
+    r = say(api, first, "set it up")
+    never = Script()  # no steps: the model must not be called at all
+    r2 = say(api, never, "why is the minimum margin that much?", r["session_id"])
+    b = chat.quote_view(slots)["margin_breakdown"]
+    assert never.seen == [] and r2["reply"] == chat.explain_margin(chat.quote_view(slots))
+    for key in ("minimum_margin_usd", "hedge_size_oz", "mark_price_usd", "notional_usd", "initial_margin_usd", "buffer_pct", "required_margin_usd", "tolerance_pct", "lowest_accepted_usd"):
+        assert str(b[key]) in r2["reply"], key
+    assert f"{b['leverage']}x leverage" in r2["reply"]
+    asked_numbers = {x for x in re.findall(r"\d+(?:\.\d+)?", r2["reply"])}
+    allowed = {str(v) for v in b.values()} | {str(b["leverage"])}
+    assert asked_numbers <= allowed, asked_numbers - allowed  # every number in the explanation IS a breakdown number
+    # the same question after a change explains the NEW numbers
+    mid = Script(("tools", [("set_slot", {"name": "exposure_units", "value": "0.02"})]), ("text", "Changed."))
+    say(api, mid, "make it 0.02 oz", r["session_id"])
+    r3 = say(api, Script(), "why is that the minimum?", r["session_id"])
+    assert "0.02 oz" in r3["reply"] and b["minimum_margin_usd"] not in r3["reply"].split("The minimum margin is $")[1].split(" ")[0]
+
+
+def test_a_why_that_is_not_about_the_margin_or_cannot_be_computed_goes_to_the_model(api):
+    s = Script(("text", "I don't know why the venue has that rule."))
+    r = say(api, s, "why does the venue need a minimum order?")  # not a margin question and nothing is set
+    assert s.seen and r["reply"] == "I don't know why the venue has that rule."
+    s2 = Script(("text", "Set the exposure first."))
+    assert say(api, s2, "why is the minimum margin so high?")["reply"] == "Set the exposure first."  # nothing to explain yet: no invented numbers
+
+
+def test_a_bare_followup_why_after_a_margin_reply_is_a_margin_why_but_other_whys_are_not(api):
+    slots = {**BASE, "exposure_units": "0.005"}
+    r = say(api, Script(set_all(slots), ("tools", [("get_quote", {})]), ("text", "The minimum margin is $6. How much would you like to put up?")), "set it up")
+    why = Script()  # the model must not be called
+    assert say(api, why, "why is it that much?", r["session_id"])["reply"] == chat.explain_margin(chat.quote_view(slots)) and why.seen == []
+    other = Script(("text", "I don't know why the venue has a minimum order."))
+    assert say(api, other, "why does the venue have a minimum order?", r["session_id"])["reply"].startswith("I don't know why")  # not our margin: the model, which must say it doesn't know
+    lev = Script(("text", "I don't know why leverage is capped."))
+    assert say(api, lev, "why is leverage capped at 3?", r["session_id"])["reply"].startswith("I don't know why")
+    assert chat.asks_why_margin("why is the minimum margin so high", "") and not chat.asks_why_margin("why is it that much?", "Which wallet?")
+    assert not chat.asks_why_margin("what is the margin?", "The minimum margin is $6.")  # not a why
+
+
+def test_a_model_that_already_paraphrased_the_small_hedge_warning_is_not_told_twice(api):
+    s = Script(set_all({**BASE, "exposure_units": "0.005"}), ("text", "Set. Note this hedge is so small that rebalances may fall under the venue minimum, so autopilot can't adjust it."))
+    r = say(api, s, "0.005 oz")
+    assert r["reply"].count("autopilot") == 1 and chat.SMALL_HEDGE_NOTE not in r["reply"]
+    plain = Script(set_all({**BASE, "exposure_units": "0.005"}), ("text", "Set."))
+    assert say(api, plain, "0.005 oz")["reply"].count("autopilot") == 1  # the server's exact wording when the model said nothing
+
+
+def test_the_model_is_told_to_state_only_fresh_figures_and_never_to_invent_reasons(api):
+    s = Script(("text", "hi"))
+    say(api, s)
+    prompt = s.seen[0][0]["content"]
+    assert "THIS turn" in prompt and "get_quote" in prompt and "never repeat a figure" in prompt.lower().replace("never repeat", "never repeat")
+    assert "NEVER explain why the server has a rule" in prompt and "say you don't know why" in prompt and "doesn't change" in prompt and "do NOT repeat it yourself" in prompt
+
+
+def test_a_stale_figure_from_earlier_in_the_conversation_is_caught_and_restated(api):
+    s1 = Script(set_all({**BASE, "exposure_units": "0.1"}), ("tools", [("get_quote", {})]), ("text", "The minimum margin is $104."))
+    r = say(api, s1, "0.1 oz")
+    assert r["reply"] == "The minimum margin is $104."  # grounded in this turn's get_quote
+    # next turn: exposure changes, and the model parrots the old figure from memory
+    s2 = Script(("tools", [("set_slot", {"name": "exposure_units", "value": "0.005"})]), ("text", "The minimum margin is still $104."),
+                ("tools", [("get_quote", {})]), ("text", "The minimum margin is now $6."))
+    r2 = say(api, s2, "make it 0.005 oz", r["session_id"])
+    assert r2["reply"].startswith("The minimum margin is now $6.") and "$104" not in r2["reply"]
+    assert any("did not come from a tool result" in m["content"] for m in s2.seen[-1] if m["role"] == "system")  # it was told why it was asked again
+    # a model that keeps saying the old number is replaced by the server's own figures
+    s3 = Script(("tools", [("set_slot", {"name": "exposure_units", "value": "0.006"})]), ("text", "The minimum is $104."), ("text", "It is $104, same as before."))
+    r3 = say(api, s3, "0.006 oz", r["session_id"])
+    assert "104" not in r3["reply"] and "server's figures" in r3["reply"] and "minimum margin $" in r3["reply"] and "I can't confirm" in r3["reply"]
+    assert chat.quote_view({**BASE, "exposure_units": "0.006"})["minimum_margin_usd"] in r3["reply"]
+
+
+def test_rounded_and_user_supplied_figures_are_not_flagged(api):
+    s = Script(set_all({**BASE, "exposure_units": "0.005"}),
+               ("text", "At 0.005 oz the minimum is about $6, roughly $5.30 required. You mentioned $200; your wallet has $500.00."))
+    r = say(api, s, "make it 0.005 oz; I can put in $200")
+    assert r["reply"].startswith("At 0.005 oz the minimum is about $6")  # no retry: the script has no second step, so a retry would have raised
+
+
+def test_a_hedge_under_21_dollars_is_warned_about_but_never_blocked(api):
+    note = "This hedge is so small that future rebalances may fall below the venue's minimum order, so autopilot won't be able to adjust it."
+    assert chat.SMALL_HEDGE_NOTE == note
+    s = Script(set_all({**BASE, "exposure_units": "0.005"}), ("text", "Exposure set."))
+    r = say(api, s, "0.005 oz")  # $13.25 of notional
+    assert r["reply"].endswith(note) and r["reply"].count(note) == 1 and r["status"] == "collecting"
+    set_result = [x for x in s.tool_log if x.get("stored", {}).get("exposure_units") == "0.005"][0]
+    assert set_result["quote"]["warnings"] == [note]  # the model is told too
+    again = Script(("text", "Which wallet?"))
+    assert note not in say(api, again, "hmm", r["session_id"])["reply"]  # not repeated on a turn that changed nothing about the size
+    # exactly at the line: $21 of notional (0.0079 oz is $20.94, 0.008 oz is $21.20)
+    below = Script(("tools", [("set_slot", {"name": "exposure_units", "value": "0.0079"})]), ("text", "Set."))
+    above = Script(("tools", [("set_slot", {"name": "exposure_units", "value": "0.008"})]), ("text", "Set."))
+    assert note in say(api, below, "0.0079", r["session_id"])["reply"]
+    assert note not in say(api, above, "0.008", r["session_id"])["reply"]
+    # not blocking: a complete small hedge is a ready draft that carries the note
+    done = Script(set_all(full_slots(exposure_units="0.005", hedge_ratio_pct="100", margin_amount_usd="6")), ("text", "All set."))
+    chat._rate.clear()
+    rd = say(api, done, "everything")
+    assert rd["status"] == "ready" and rd["draft"]["recommendation"]["small_hedge_note"] == note and rd["reply"].endswith(note)
+    big = say(api, Script(set_all(full_slots(exposure_units="0.2", hedge_ratio_pct="100", margin_amount_usd="250")), ("text", "Bigger.")), "0.2 oz", rd["session_id"])
+    assert big["status"] == "ready" and big["draft"]["recommendation"]["small_hedge_note"] is None and chat.SMALL_HEDGE_NOTE not in big["reply"]

@@ -35,6 +35,17 @@ _REAL_ENSURE_CURSOR = _watcher.ensure_cursor
 
 
 @pytest.fixture(autouse=True)
+def hermetic_ai_settings(monkeypatch):
+    """The suite must not depend on the developer's .env: the AI and data-feed switches and keys are reset to their shipped defaults, and any test
+    that needs one sets it explicitly."""
+    from app.config import settings
+
+    for name, value in (("agent_enabled", False), ("custody_proof_mode", "off"), ("public_url", ""), ("jev_api_key", ""), ("llm_api_key", ""),
+                        ("signals_source_network", "mainnet")):
+        monkeypatch.setattr(settings, name, value)
+
+
+@pytest.fixture(autouse=True)
 def agent_key_in_tmp(tmp_path, monkeypatch):
     """No test may touch the real keys/ directory: the agent key lives in a per-test temporary path (absent until a test creates it)."""
     from app.config import settings
